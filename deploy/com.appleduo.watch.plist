@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Local macOS deployment, runs whether or not the Claude app is open:
+     cp deploy/com.appleduo.watch.plist ~/Library/LaunchAgents/
+     launchctl load -w ~/Library/LaunchAgents/com.appleduo.watch.plist -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.appleduo.watch</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>-I</string>
+    <string>/Users/alex/pupazalupa/watcher.py</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>INTERVAL_SECONDS</key><string>60</string>
+    <key>CITY</key><string>Dubai</string>
+    <key>ALERT_BEFORE</key><string>2026-12-31</string>
+    <key>STATE_FILE</key><string>/Users/alex/.apple-duo-watch/state.json</string>
+    <key>TELEGRAM_BOT_TOKEN</key><string>PUT_TOKEN_HERE</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>/Users/alex/.apple-duo-watch/stdout.log</string>
+  <key>StandardErrorPath</key><string>/Users/alex/.apple-duo-watch/stderr.log</string>
+</dict>
+</plist>
