@@ -64,6 +64,20 @@ docker compose logs -f
 
 State survives restarts in the `duo-state` volume.
 
+### On a server over SSH
+
+From this checkout, with `.env` filled in:
+
+```sh
+./deploy/remote-install.sh user@your-host
+```
+
+It copies `watcher.py`, the Dockerfile, the compose file and `.env` to
+`/opt/apple-duo-watch` on the host and runs `docker compose up -d --build`.
+Re-run the same command to deploy an update. The server needs Docker with
+compose v2 and nothing else — no GitHub credentials, since the files are
+copied rather than cloned.
+
 ### systemd (no Docker)
 
 ```sh
