@@ -121,6 +121,32 @@ Every setting is an environment variable, documented in `.env.example`:
 `ALERT_BEFORE`, `ONLY_PARTS`, `STATE_FILE`. CLI flags of the same name win over
 the environment.
 
+## When Telegram is blocked on the watcher's network
+
+The deployment this repo was written for sits on a Russian home ISP, where
+`api.telegram.org`, `core.telegram.org` and `t.me` do not accept TCP at all
+(DNS resolves fine, so the filtering is by IP), while Apple, GitHub and
+everything else is reachable. Two pieces handle that:
+
+- `TELEGRAM_PROXY` sends **only** the Bot API calls through an HTTP proxy.
+  Apple is always fetched directly, so nothing else rides the tunnel.
+- `deploy/telegram-tunnel.service` keeps an SSH tunnel to a VPS outside that
+  network, exposing the VPS's loopback-only tinyproxy on the docker bridge
+  (`172.17.0.1:8888`) where the container can reach it. The transport is SSH,
+  so a DPI box sees a connection to the VPS and nothing about Telegram.
+
+On the VPS, tinyproxy listens on `127.0.0.1:8888` only, and the tunnel key is
+restricted in `authorized_keys` to that one forward with no shell:
+
+```
+restrict,port-forwarding,permitopen="127.0.0.1:8888",command="/bin/false" ssh-ed25519 …
+```
+
+`NTFY_URL` adds a second channel for when the tunnel itself is down. A change
+that reaches no channel is not marked as seen, so the next check reports it
+again rather than losing it — but a second channel still gets the alert out
+sooner.
+
 ## Polling rate
 
 `INTERVAL_SECONDS=60` is the intended cadence. Two things to know:

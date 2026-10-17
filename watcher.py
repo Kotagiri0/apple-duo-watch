@@ -8,6 +8,11 @@ Configuration comes from the environment (see .env.example):
 
   TELEGRAM_BOT_TOKEN   bot token from @BotFather; without it alerts only go to stdout
   TELEGRAM_CHAT_ID     chat to notify; if unset, the first /start sender is adopted
+  TELEGRAM_PROXY       http(s) proxy for Telegram only, e.g. http://host:3128;
+                       needed on networks where api.telegram.org is blocked
+  NTFY_URL             ntfy topic URL to also post alerts to, e.g.
+                       https://ntfy.sh/some-private-topic
+  NTFY_TOKEN           bearer token, if the ntfy server requires one
   INTERVAL_SECONDS     seconds between checks (default 60)
   CITY                 city for in-store pickup lookups (default Dubai, "" to skip)
   ALERT_BEFORE         YYYY-MM-DD; always alert while any SKU ships on or before it
@@ -225,10 +230,17 @@ def save_state(path, state):
 class Telegram:
     """Minimal Bot API client: push alerts out, answer a few commands."""
 
-    def __init__(self, token, chat_id=None):
+    def __init__(self, token, chat_id=None, proxy=None):
         self.token = token
         self.chat_id = chat_id
         self.offset = None
+        self.proxy = proxy
+        self._fail_streak = 0
+        # A proxy here must not touch the Apple requests, so Telegram gets its
+        # own opener instead of the process-wide default.
+        handlers = [urllib.request.ProxyHandler(
+            {"http": proxy, "https": proxy} if proxy else {})]
+        self.opener = urllib.request.build_opener(*handlers)
 
     @property
     def enabled(self):
@@ -242,18 +254,25 @@ class Telegram:
             {k: v for k, v in params.items() if v is not None}).encode()
         try:
             req = urllib.request.Request(url, data=data)
-            with urllib.request.urlopen(req, timeout=60) as r:
-                return json.loads(r.read().decode("utf-8"))
+            with self.opener.open(req, timeout=60) as r:
+                out = json.loads(r.read().decode("utf-8"))
+            self._fail_streak = 0
+            return out
         except (urllib.error.URLError, urllib.error.HTTPError, ValueError,
                 TimeoutError) as e:
-            log.warning("telegram %s failed: %s", method, e)
+            # On a network that blocks api.telegram.org every call fails, so
+            # the first failure and then every 30th are logged, not all of them.
+            self._fail_streak += 1
+            if self._fail_streak == 1 or self._fail_streak % 30 == 0:
+                log.warning("telegram %s failed (%d in a row): %s",
+                            method, self._fail_streak, e)
             return None
 
-    def send(self, text):
+    def send(self, html, text=None):
         if not self.chat_id:
             log.warning("no TELEGRAM_CHAT_ID yet; send /start to the bot")
             return False
-        res = self._call("sendMessage", chat_id=self.chat_id, text=text,
+        res = self._call("sendMessage", chat_id=self.chat_id, text=html,
                          parse_mode="HTML", disable_web_page_preview="true")
         return bool(res and res.get("ok"))
 
@@ -274,10 +293,53 @@ class Telegram:
         return out
 
 
+class Ntfy:
+    """Post alerts to an ntfy topic. Plain HTTP, no account, no SDK."""
+
+    def __init__(self, url, token=None):
+        self.url = (url or "").strip().rstrip("/")
+        self.token = (token or "").strip()
+
+    @property
+    def enabled(self):
+        return bool(self.url)
+
+    def send(self, html, text=None):
+        if not self.url:
+            return False
+        body = (text if text is not None else html).encode("utf-8")
+        # HTTP header values are latin-1, so the title stays ASCII; the
+        # body carries the UTF-8 text.
+        headers = {"Title": "iPhone Duo - Apple UAE",
+                   "Content-Type": "text/plain; charset=utf-8"}
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+        try:
+            req = urllib.request.Request(self.url, data=body, headers=headers)
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return 200 <= r.status < 300
+        except (urllib.error.URLError, urllib.error.HTTPError, ValueError,
+                TimeoutError) as e:
+            log.warning("ntfy post failed: %s", e)
+            return False
+
+
+def announce(notifiers, html, text):
+    """Fan an alert out to every configured channel. Returns how many took it."""
+    sent = 0
+    for n in notifiers:
+        if n.enabled and n.send(html, text):
+            sent += 1
+    return sent
+
+
 # ------------------------------------------------------------------ service
 
-def render_status(current, parts, pickup, checked_at):
-    lines = [f"<b>iPhone Duo — Apple UAE</b>  <i>{checked_at}</i>"]
+def render_status(current, parts, pickup, checked_at, html=True):
+    if html:
+        lines = [f"<b>iPhone Duo — Apple UAE</b>  <i>{checked_at}</i>"]
+    else:
+        lines = [f"iPhone Duo — Apple UAE  ({checked_at})"]
     for pn, (name, price) in parts.items():
         cur = current.get(pn)
         if not cur:
@@ -286,13 +348,37 @@ def render_status(current, parts, pickup, checked_at):
         mark = "✅" if cur["buyable"] else "⛔️"
         pk = pickup.get(pn)
         tail = f"  📦 {'; '.join(pk)}" if pk else ""
-        lines.append(f'{mark} <a href="{link_for(pn)}">{name}</a> — '
-                     f'{cur["label"]}, {price} AED{tail}')
+        if html:
+            lines.append(f'{mark} <a href="{link_for(pn)}">{name}</a> — '
+                         f'{cur["label"]}, {price} AED{tail}')
+        else:
+            lines.append(f'{mark} {name} — {cur["label"]}, {price} AED{tail}'
+                         f'\n   {link_for(pn)}')
     return "\n".join(lines)
 
 
-def check_once(cfg, tg, announce=True):
+ALERT_ICONS = {"EARLIER": "⏩", "BUYABLE": "🟢", "TARGET": "🎯",
+               "PICKUP": "🏬", "CHANGED": "ℹ️"}
+
+
+def render_alert(events, html=True):
+    head = ("🔔 <b>iPhone Duo — изменение в Apple UAE</b>" if html
+            else "🔔 iPhone Duo — изменение в Apple UAE")
+    body = []
+    for kind, pn, name, price, detail, link in events:
+        icon = ALERT_ICONS.get(kind, "•")
+        if html:
+            body.append(f'{icon} <a href="{link}">{name}</a> — {detail}'
+                        f'\n    {price} AED')
+        else:
+            body.append(f'{icon} {name} — {detail}\n    {price} AED\n    {link}')
+    return (head + "\n" + "\n".join(body)
+            + "\n\nОформление и оплату подтверждаешь сам.")
+
+
+def check_once(cfg, notifiers, notify=True):
     """One pass. Returns (events, current, pickup). Raises AppleUnreachable."""
+    tg = next((n for n in notifiers if isinstance(n, Telegram)), None)
     today = dt.date.today()
     current = fetch_delivery(cfg.parts, today)
     pickup = fetch_pickup(cfg.parts, cfg.city)
@@ -302,37 +388,48 @@ def check_once(cfg, tg, announce=True):
     events = diff(previous, current, pickup, cfg.parts, cfg.threshold)
 
     checked_at = dt.datetime.now().astimezone().isoformat(timespec="seconds")
-    state["parts"] = current
     state["checked_at"] = checked_at
-    if tg.chat_id:
+    if tg and tg.chat_id:
         state["chat_id"] = tg.chat_id
-    save_state(cfg.state_file, state)
+
+    def persist():
+        state["parts"] = current
+        save_state(cfg.state_file, state)
 
     if not previous:
         best = min((p["date"] for p in current.values() if p.get("date")),
                    default=None)
         log.info("baseline recorded for %d SKUs, earliest ship date %s",
                  len(current), best)
-        if announce and tg.enabled:
-            tg.send("👀 Слежу за iPhone Duo в Apple UAE.\n"
-                    + render_status(current, cfg.parts, pickup, checked_at)
-                    + f"\n\nПроверка каждые {cfg.interval} с. "
-                      "Напишу, как только отправка станет раньше.")
+        persist()
+        if notify:
+            tail = (f"\n\nПроверка каждые {cfg.interval} с. "
+                    "Напишу, как только отправка станет раньше.")
+            announce(
+                notifiers,
+                "👀 Слежу за iPhone Duo в Apple UAE.\n"
+                + render_status(current, cfg.parts, pickup, checked_at) + tail,
+                "👀 Слежу за iPhone Duo в Apple UAE.\n"
+                + render_status(current, cfg.parts, pickup, checked_at,
+                                html=False) + tail)
         return [], current, pickup
 
     for ev in events:
         log.info("%s", format_event(ev))
 
-    if events and announce and tg.enabled:
-        head = "🔔 <b>iPhone Duo — изменение в Apple UAE</b>"
-        body = []
-        for kind, pn, name, price, detail, link in events:
-            icon = {"EARLIER": "⏩", "BUYABLE": "🟢", "TARGET": "🎯",
-                    "PICKUP": "🏬", "CHANGED": "ℹ️"}.get(kind, "•")
-            body.append(f'{icon} <a href="{link}">{name}</a> — {detail}'
-                        f'\n    {price} AED')
-        tg.send(head + "\n" + "\n".join(body)
-                + "\n\nОформление и оплату подтверждаешь сам.")
+    if events and notify:
+        delivered = announce(notifiers, render_alert(events),
+                             render_alert(events, html=False))
+        if not delivered:
+            # Persisting now would make this change "already seen" and it would
+            # never be reported again, so the old state stays and the next
+            # check rediscovers it.
+            log.warning("found %d change(s) but no channel accepted them; "
+                        "keeping the previous state so the next check retries",
+                        len(events))
+            return events, current, pickup
+
+    persist()
     return events, current, pickup
 
 
@@ -361,7 +458,8 @@ def handle_commands(cfg, tg, last):
                     "оплату подтверждаешь ты.")
 
 
-def serve(cfg, tg):
+def serve(cfg, notifiers):
+    tg = next((n for n in notifiers if isinstance(n, Telegram)), None)
     stop = {"now": False}
 
     def _stop(signum, _frame):
@@ -371,15 +469,17 @@ def serve(cfg, tg):
     signal.signal(signal.SIGINT, _stop)
     signal.signal(signal.SIGTERM, _stop)
 
-    log.info("watching %d SKUs every %ds (city=%s, telegram=%s)",
-             len(cfg.parts), cfg.interval, cfg.city or "off",
-             "on" if tg.enabled else "off")
+    channels = ", ".join(
+        f"{type(n).__name__.lower()}{'+proxy' if getattr(n, 'proxy', None) else ''}"
+        for n in notifiers if n.enabled) or "none (stdout only)"
+    log.info("watching %d SKUs every %ds (city=%s, channels=%s)",
+             len(cfg.parts), cfg.interval, cfg.city or "off", channels)
 
     last = ({}, {}, "")
     backoff = 0
     while not stop["now"]:
         try:
-            events, current, pickup = check_once(cfg, tg)
+            events, current, pickup = check_once(cfg, notifiers)
             last = (current, pickup,
                     dt.datetime.now().astimezone().isoformat(timespec="seconds"))
             backoff = 0
@@ -395,7 +495,7 @@ def serve(cfg, tg):
             log.exception("unexpected error in check loop")
             backoff = min(backoff * 2 or cfg.interval, 900)
 
-        if tg.enabled:
+        if tg and tg.enabled:
             try:
                 handle_commands(cfg, tg, last)
             except Exception:
@@ -457,7 +557,11 @@ def main(argv=None):
     state = load_state(cfg.state_file)
     tg = Telegram(os.environ.get("TELEGRAM_BOT_TOKEN", "").strip(),
                   os.environ.get("TELEGRAM_CHAT_ID", "").strip()
-                  or state.get("chat_id"))
+                  or state.get("chat_id"),
+                  os.environ.get("TELEGRAM_PROXY", "").strip() or None)
+    ntfy = Ntfy(os.environ.get("NTFY_URL", ""),
+                os.environ.get("NTFY_TOKEN", ""))
+    notifiers = [tg, ntfy]
 
     if args.show:
         try:
@@ -478,7 +582,7 @@ def main(argv=None):
 
     if args.once:
         try:
-            events, _, _ = check_once(cfg, tg)
+            events, _, _ = check_once(cfg, notifiers)
         except AppleUnreachable as e:
             print(f"apple unreachable: {e}", file=sys.stderr)
             return 1
@@ -486,7 +590,7 @@ def main(argv=None):
             log.info("no change")
         return 0
 
-    serve(cfg, tg)
+    serve(cfg, notifiers)
     return 0
 
 
