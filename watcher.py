@@ -32,6 +32,9 @@ Configuration comes from the environment (see .env.example):
                        (default 60), so a 10s interval does not hammer it
   HISTORY_FILE         where to keep the findings log that /alerts reads;
                        defaults to the state file's name plus "-history"
+  TELEGRAM_ADMINS      comma-separated ids and/or @handles allowed to command
+                       the bot besides TELEGRAM_CHAT_ID; handles are pinned to
+                       an id the first time that person writes
 """
 import argparse
 import collections
@@ -403,11 +406,18 @@ class Telegram:
     def fail_streak(self):
         return self._fail_streak
 
-    def send(self, html, text=None, markup=None):
-        if not self.chat_id:
+    def send(self, html, text=None, markup=None, to=None):
+        """Send to `to`, or to the owner's chat when it is not given.
+
+        Replies go back to whoever asked, while findings keep going to the
+        owner: letting someone read the store is not the same as moving the
+        bot's notifications into their pocket.
+        """
+        target = to if to is not None else self.chat_id
+        if not target:
             log.warning("no TELEGRAM_CHAT_ID yet; send /start to the bot")
             return False
-        res = self._call("sendMessage", chat_id=self.chat_id, text=html,
+        res = self._call("sendMessage", chat_id=target, text=html,
                          parse_mode="HTML", disable_web_page_preview="true",
                          reply_markup=json.dumps(markup) if markup else None)
         return bool(res and res.get("ok"))
@@ -419,7 +429,7 @@ class Telegram:
         return bool(res and res.get("ok"))
 
     def poll_commands(self, timeout=0):
-        """Return [(chat_id, text)] for new messages. Long-polls when timeout>0."""
+        """Return [(chat_id, username, text)]. Long-polls when timeout>0."""
         res = self._call("getUpdates", offset=self.offset, timeout=timeout,
                          allowed_updates=json.dumps(["message"]))
         if not res or not res.get("ok"):
@@ -430,8 +440,11 @@ class Telegram:
             msg = upd.get("message") or {}
             chat = (msg.get("chat") or {}).get("id")
             text = (msg.get("text") or "").strip()
+            # The handle is how a person is let in before the bot has ever
+            # seen them; the id is what access is pinned to afterwards.
+            who = (msg.get("from") or {}).get("username")
             if chat is not None and text:
-                out.append((str(chat), text))
+                out.append((str(chat), who, text))
         return out
 
 
@@ -922,6 +935,126 @@ def check_once(cfg, notifiers, notify=True, with_pickup=True):
     return events, current, pickup
 
 
+# -------------------------------------------------------------------- access
+
+def norm_handle(name):
+    """'@DhXd263' -> 'dhxd263'. Telegram handles are case-insensitive."""
+    return (name or "").strip().lstrip("@").lower()
+
+
+def seed_admins(cfg, state):
+    """Fold TELEGRAM_ADMINS into the state. Idempotent, so a restart is free."""
+    admins = state.setdefault("admins", {})
+    waiting = state.setdefault("admin_usernames", [])
+    changed = False
+    known = {rec.get("username") for rec in admins.values() if rec.get("username")}
+    for entry in cfg.admin_seed:
+        token = entry.lstrip("@")
+        if token.isdigit():
+            if token not in admins:
+                admins[token] = {"username": None, "at": now_iso(),
+                                 "added_by": "TELEGRAM_ADMINS"}
+                changed = True
+        else:
+            handle = norm_handle(token)
+            if handle and handle not in known and handle not in waiting:
+                waiting.append(handle)
+                changed = True
+    return changed
+
+
+def authorize(state, owner, chat_id, username):
+    """May this chat command the bot? Returns (allowed, state_changed).
+
+    A handle on the waiting list is claimed on first contact and pinned to the
+    numeric id, because a Telegram handle can be given up and taken over by
+    somebody else, while an id cannot. After that the handle is only a label.
+    """
+    chat_id = str(chat_id)
+    if owner and chat_id == str(owner):
+        return True, False
+    admins = state.setdefault("admins", {})
+    if chat_id in admins:
+        return True, False
+    handle = norm_handle(username)
+    waiting = state.get("admin_usernames") or []
+    if handle and handle in [norm_handle(w) for w in waiting]:
+        admins[chat_id] = {"username": handle, "at": now_iso(),
+                           "added_by": "список ожидания"}
+        state["admin_usernames"] = [w for w in waiting
+                                    if norm_handle(w) != handle]
+        log.info("admin @%s claimed and pinned to chat %s", handle, chat_id)
+        return True, True
+    return False, False
+
+
+def render_admins(state, owner, html=True):
+    """Answer for /admins: who may command the bot, and who is still awaited."""
+    lines = ["<b>Кто управляет ботом</b>" if html else "Кто управляет ботом"]
+    lines.append(f"👑 {owner} — владелец, снять нельзя")
+    for cid, rec in sorted((state.get("admins") or {}).items()):
+        if owner and cid == str(owner):
+            continue
+        who = f"@{rec['username']}" if rec.get("username") else f"id {cid}"
+        lines.append(f"• {who} — id {cid}, добавил {rec.get('added_by') or '?'}"
+                     + (f", {rec['at'][:16].replace('T', ' ')}"
+                        if rec.get("at") else ""))
+    for handle in state.get("admin_usernames") or []:
+        lines.append(f"⏳ @{handle} — впущен, но ещё не писал боту; "
+                     f"id закрепится за ним при первом сообщении")
+    if len(lines) == 2:
+        lines.append("Больше никого. /addadmin @имя — впустить.")
+    lines.append("")
+    lines.append("Добавлять и убирать может только тот, кто уже в этом списке.")
+    return "\n".join(lines)
+
+
+def add_admin(state, target, by):
+    """/addadmin. Numbers are pinned at once, handles wait for first contact."""
+    token = target.lstrip("@")
+    if token.isdigit():
+        admins = state.setdefault("admins", {})
+        if token in admins:
+            return f"id {token} уже в списке."
+        admins[token] = {"username": None, "at": now_iso(), "added_by": by}
+        return f"✅ id {token} теперь админ."
+    handle = norm_handle(token)
+    if not handle or not re.fullmatch(r"[a-z0-9_]{4,32}", handle):
+        return ("Это не похоже на имя пользователя Telegram. "
+                "Напиши /addadmin @имя или /addadmin 123456789.")
+    for cid, rec in (state.get("admins") or {}).items():
+        if rec.get("username") == handle:
+            return f"@{handle} уже админ (id {cid})."
+    waiting = state.setdefault("admin_usernames", [])
+    if handle in [norm_handle(w) for w in waiting]:
+        return f"@{handle} уже в списке ожидания."
+    waiting.append(handle)
+    return (f"✅ @{handle} впущен. Доступ откроется, когда он сам напишет "
+            f"боту: тогда за ним закрепится его id.")
+
+
+def remove_admin(state, owner, target):
+    """/deladmin. The owner cannot be removed — that would lock everyone out."""
+    token = target.lstrip("@")
+    if owner and token == str(owner):
+        return "Владельца снять нельзя."
+    admins = state.setdefault("admins", {})
+    if token.isdigit() and token in admins:
+        del admins[token]
+        return f"🚫 id {token} больше не админ."
+    handle = norm_handle(token)
+    for cid, rec in list(admins.items()):
+        if rec.get("username") == handle:
+            del admins[cid]
+            return f"🚫 @{handle} (id {cid}) больше не админ."
+    waiting = state.get("admin_usernames") or []
+    if handle in [norm_handle(w) for w in waiting]:
+        state["admin_usernames"] = [w for w in waiting
+                                    if norm_handle(w) != handle]
+        return f"🚫 @{handle} убран из списка ожидания."
+    return f"{target} и так не в списке."
+
+
 class Runtime:
     """What the command handlers need to know about the running service."""
 
@@ -939,12 +1072,15 @@ class Runtime:
 
 COMMANDS = [
     ("status", "даты отправки по всем конфигурациям"),
+    ("admins", "кто управляет ботом"),
     ("alerts", "последние находки, например /alerts 25"),
     ("check", "проверить прямо сейчас, не дожидаясь интервала"),
     ("health", "самочувствие наблюдателя"),
     ("log", "хвост лога, например /log 50 или /log errors"),
     ("pause", "замолчать, не прекращая следить"),
     ("resume", "снова присылать уведомления"),
+    ("addadmin", "впустить: /addadmin @имя"),
+    ("deladmin", "убрать: /deladmin @имя"),
     ("help", "что умеет бот"),
 ]
 
@@ -966,12 +1102,12 @@ def render_help(html=True):
     return "\n".join(lines)
 
 
-def run_check_now(rt, tg):
+def run_check_now(rt, tg, to=None):
     """/check: a pass right now, instead of waiting out the interval."""
     try:
         events, current, pickup = check_once(rt.cfg, rt.notifiers)
     except AppleUnreachable as e:
-        tg.send(f"Apple не ответил: {esc(e)}")
+        tg.send(f"Apple не ответил: {esc(e)}", to=to)
         return
     rt.current, rt.pickup, rt.checked_at = current, pickup, now_iso()
     rt.cycles += 1
@@ -979,19 +1115,20 @@ def run_check_now(rt, tg):
     if not events:
         tg.send("Изменений нет.\n" + render_status(
             current, rt.cfg.parts, pickup, rt.checked_at,
-            footer=status_footer(rt, state)))
+            footer=status_footer(rt, state)), to=to)
     elif state.get("paused"):
         tg.send(f"Нашёл изменений: {len(events)}. Уведомления на паузе, "
-                f"так что записал в историю — /resume покажет.")
+                f"так что записал в историю — /resume покажет.", to=to)
     else:
-        tg.send(f"Нашёл изменений: {len(events)} — прислал отдельным "
-                f"сообщением.")
+        # check_once announced them to the owner's chat, not necessarily here.
+        tg.send(f"Нашёл изменений: {len(events)} — уведомление ушло в чат "
+                f"владельца.", to=to)
 
 
 def handle_commands(rt, tg):
-    """Answer the owner's commands; everyone else gets silence."""
+    """Answer the admins' commands; everyone else gets silence."""
     cfg = rt.cfg
-    for chat_id, text in tg.poll_commands():
+    for chat_id, username, text in tg.poll_commands():
         cmd = text.split()[0].lower().lstrip("/").split("@")[0]
         if tg.chat_id is None:
             tg.chat_id = chat_id
@@ -999,54 +1136,89 @@ def handle_commands(rt, tg):
             state["chat_id"] = chat_id
             save_state(cfg.state_file, state)
             log.info("adopted chat_id %s", chat_id)
-        if chat_id != tg.chat_id:
-            # Only the owner's chat is answered, and a stranger is told
-            # nothing at all — not even that the command exists.
-            log.warning("ignoring /%s from chat %s", cmd, chat_id)
+
+        state = load_state(cfg.state_file)
+        allowed, claimed = authorize(state, tg.chat_id, chat_id, username)
+        if claimed:
+            save_state(cfg.state_file, state)
+        if not allowed:
+            # A stranger is told nothing at all — not even that the command
+            # exists. The handle is logged because that is what you need to
+            # decide whether it was someone you meant to let in.
+            log.warning("ignoring /%s from chat %s (@%s)", cmd, chat_id,
+                        username or "?")
             continue
         # Logged so that /log alone shows whether a command ever arrived and
         # was accepted — the symptom of the chat_id mismatch was silence, and
         # silence is the one thing a log should never leave ambiguous.
-        log.info("command /%s from the owner", cmd)
-        state = load_state(cfg.state_file)
+        log.info("command /%s from %s (@%s)", cmd, chat_id, username or "?")
 
-        if cmd in ("start", "status"):
-            if rt.current:
-                tg.send(render_status(rt.current, cfg.parts, rt.pickup,
-                                      rt.checked_at,
-                                      footer=status_footer(rt, state)))
+        dispatch(rt, tg, state, cmd, text, chat_id, username)
+
+
+def dispatch(rt, tg, state, cmd, text, chat_id, username):
+    """Run one command. `chat_id` is whoever asked; tg.chat_id stays the owner."""
+    cfg = rt.cfg
+    owner = tg.chat_id
+
+    def reply(body, markup=None):
+        return tg.send(body, None, markup, to=chat_id)
+
+    if cmd in ("start", "status"):
+        if rt.current:
+            reply(render_status(rt.current, cfg.parts, rt.pickup, rt.checked_at,
+                                footer=status_footer(rt, state)))
+        else:
+            reply("Ещё не делал первую проверку, подожди минуту.")
+    elif cmd == "alerts":
+        reply(render_alerts(load_history(cfg.history_file),
+                            parse_count(text, 10, 50)))
+    elif cmd == "health":
+        reply(render_health(cfg, tg, rt.hc, rt))
+    elif cmd == "log":
+        reply(render_log(rt.logs, parse_count(text, 20, 100),
+                         "errors" in text.lower()))
+    elif cmd == "check":
+        run_check_now(rt, tg, chat_id)
+    elif cmd == "pause":
+        state["paused"] = True
+        save_state(cfg.state_file, state)
+        reply("⏸ Уведомления выключены. Следить продолжаю: находки пишу в "
+              "историю и в лог, /resume вернёт их и снова включит сообщения.")
+    elif cmd == "resume":
+        queued = state.get("paused_queue") or []
+        state["paused"] = False
+        state["paused_queue"] = []
+        save_state(cfg.state_file, state)
+        if queued:
+            reply(render_alerts(queued, len(queued),
+                                title=f"▶️ Снова на связи. За паузу "
+                                      f"накопилось находок: {len(queued)}"))
+        else:
+            reply("▶️ Снова на связи. За паузу ничего не нашлось.")
+    elif cmd == "admins":
+        reply(render_admins(state, owner))
+    elif cmd in ("addadmin", "deladmin"):
+        parts = text.split()
+        if len(parts) < 2:
+            reply(f"Кого? Напиши /{cmd} @имя или /{cmd} 123456789.\n\n"
+                  + render_admins(state, owner))
+        else:
+            by = f"@{username}" if username else str(chat_id)
+            if cmd == "addadmin":
+                answer = add_admin(state, parts[1], by)
             else:
-                tg.send("Ещё не делал первую проверку, подожди минуту.")
-        elif cmd == "alerts":
-            tg.send(render_alerts(load_history(cfg.history_file),
-                                  parse_count(text, 10, 50)))
-        elif cmd == "health":
-            tg.send(render_health(cfg, tg, rt.hc, rt))
-        elif cmd == "log":
-            tg.send(render_log(rt.logs, parse_count(text, 20, 100),
-                               "errors" in text.lower()))
-        elif cmd == "check":
-            run_check_now(rt, tg)
-        elif cmd == "pause":
-            state["paused"] = True
+                answer = remove_admin(state, owner, parts[1])
             save_state(cfg.state_file, state)
-            tg.send("⏸ Уведомления выключены. Следить продолжаю: находки "
-                    "пишу в историю и в лог, /resume вернёт их и снова "
-                    "включит сообщения.")
-        elif cmd == "resume":
-            queued = state.get("paused_queue") or []
-            state["paused"] = False
-            state["paused_queue"] = []
-            save_state(cfg.state_file, state)
-            if queued:
-                tg.send(render_alerts(
-                    queued, len(queued),
-                    title=f"▶️ Снова на связи. За паузу накопилось находок: "
-                          f"{len(queued)}"))
-            else:
-                tg.send("▶️ Снова на связи. За паузу ничего не нашлось.")
-        elif cmd == "help":
-            tg.send(render_help())
+            log.info("/%s %s by %s -> %s", cmd, parts[1], by, answer)
+            reply(answer)
+            # The owner is told whenever the guest list changes, even when
+            # somebody else changed it: this is the one thing that decides
+            # who can silence their alerts.
+            if str(chat_id) != str(owner):
+                tg.send(f"ℹ️ {by} изменил список доступа: {answer}")
+    elif cmd == "help":
+        reply(render_help())
 
 
 def serve(cfg, notifiers, wd, hc, logs):
@@ -1071,6 +1243,13 @@ def serve(cfg, notifiers, wd, hc, logs):
     log.info("watchdog: alerting after %ds of unbroken failure; heartbeat=%s",
              cfg.blind_after,
              f"{hc.host} every {hc.every}s" if hc.enabled else "off")
+    seed_state = load_state(cfg.state_file)
+    if seed_admins(cfg, seed_state):
+        save_state(cfg.state_file, seed_state)
+    extra = len(seed_state.get("admins") or {}) + len(
+        seed_state.get("admin_usernames") or [])
+    if extra:
+        log.info("%d admin(s) besides the owner may command the bot", extra)
     if load_state(cfg.state_file).get("paused"):
         log.warning("notifications are paused (/resume to turn them back on); "
                     "findings are still recorded")
@@ -1158,6 +1337,9 @@ class Config:
         every = args.pickup_every or os.environ.get("PICKUP_EVERY")
         self.pickup_every = max(1, int(every)) if every else max(
             1, round(60 / self.interval))
+        self.admin_seed = [a.strip() for a in
+                           (os.environ.get("TELEGRAM_ADMINS") or "").split(",")
+                           if a.strip()]
         self.blind_after = int(args.blind_after
                                or os.environ.get("BLIND_AFTER_SECONDS") or 600)
         self.healthcheck_url = (os.environ.get("HEALTHCHECK_URL") or "").strip()
