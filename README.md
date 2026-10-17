@@ -1,25 +1,25 @@
 # apple-duo-watch
 
-Watches the Apple **United Arab Emirates** store for the iPhone Duo and tells you
-on Telegram the moment anything moves — an earlier ship date, a configuration
-becoming orderable again, or in-store pickup appearing.
+Следит за магазином Apple **ОАЭ** и сообщает в Telegram в тот момент, когда с
+iPhone Duo что-то меняется: дата отправки стала раньше, конфигурация снова
+доступна к заказу, появился самовывоз.
 
-It does **not** buy anything. It sends you a link that lands on the exact
-configuration; you place and pay for the order yourself.
+Сам он ничего не покупает. Присылает ссылку, которая открывает ровно нужную
+конфигурацию, — оформляешь и платишь ты.
 
-## Why it exists
+## Зачем это
 
-iPhone Duo pre-orders opened on 16 October 2026 and the launch-day stock went in
-minutes. In the UAE store all eight configurations stayed orderable, but with a
-ship date in late January. When someone cancels, freed stock shows up as an
-earlier ship date — usually for a few minutes. This service notices that within
-one polling interval.
+Предзаказы iPhone Duo открылись 16 октября 2026 года, и запас первого дня
+разобрали за минуты. В магазине ОАЭ все восемь конфигураций остались
+заказуемыми, но с отправкой в конце января. Когда кто-то отменяет заказ,
+освободившийся слот виден как более ранняя дата отправки — и обычно живёт
+несколько минут. Сервис замечает это в пределах одного интервала опроса.
 
-## What it watches
+## За чем следит
 
-All eight UAE SKUs, via two public store endpoints:
+Все восемь конфигураций магазина ОАЭ, через два публичных endpoint'а:
 
-| Part | Configuration | Price |
+| Part number | Конфигурация | Цена |
 |---|---|---|
 | MK244AH/A | 256GB Star White | 8 499 AED |
 | MK254AH/A | 256GB Night Sky | 8 499 AED |
@@ -30,135 +30,137 @@ All eight UAE SKUs, via two public store endpoints:
 | MK2A4AH/A | 2TB Star White | 13 599 AED |
 | MK2C4AH/A | 2TB Night Sky | 13 599 AED |
 
-- `GET /ae/shop/delivery-message` — ship date and buyability per part
-- `GET /ae/shop/retail/pickup-message` — pickup across the five UAE stores
+- `GET /ae/shop/delivery-message` — дата отправки и доступность каждой позиции
+- `GET /ae/shop/retail/pickup-message` — самовывоз по пяти магазинам ОАЭ
   (Dubai Mall, Mall of the Emirates, Yas Mall, Al Jimi Mall, Al Maryah Island)
 
-The last seen state is kept in a JSON file, so each run reports only what
-changed. Findings are classified: `EARLIER`, `BUYABLE`, `TARGET`, `PICKUP`,
-`CHANGED`.
+Последнее увиденное состояние хранится в JSON-файле, поэтому каждый прогон
+сообщает только то, что изменилось. Находки размечены по типу: `EARLIER`,
+`BUYABLE`, `TARGET`, `PICKUP`, `CHANGED`.
 
-## Telegram bot
+Если находку не принял ни один канал, состояние **не** сдвигается — следующая
+проверка обнаружит её заново, вместо того чтобы потерять навсегда.
 
-1. Message [@BotFather](https://t.me/BotFather), send `/newbot`, follow the
-   prompts, copy the token it gives you.
-2. Put the token in `.env` as `TELEGRAM_BOT_TOKEN`. Leave `TELEGRAM_CHAT_ID`
-   empty.
-3. Start the service, then send `/start` to your bot. The first chat to write in
-   is adopted and saved to the state file — no need to look up a chat id.
+## Telegram-бот
 
-Commands: `/status` (current ship dates for every configuration), `/help`.
+1. Напиши [@BotFather](https://t.me/BotFather), отправь `/newbot`, пройди шаги,
+   скопируй выданный токен.
+2. Положи токен в `.env` как `TELEGRAM_BOT_TOKEN`. `TELEGRAM_CHAT_ID` оставь
+   пустым.
+3. Запусти сервис и отправь боту `/start`. Первый написавший чат становится
+   получателем и сохраняется в файл состояния — искать chat_id руками не нужно.
 
-The token is a credential: it lives in `.env`, which is gitignored. Do not
-commit it, and rotate it via `/revoke` in BotFather if it leaks.
+Команды: `/status` — текущие даты отправки по всем конфигурациям, `/help`.
 
-## Deployment layout
+Токен — это секрет: он лежит в `.env`, который в `.gitignore`. Не коммить его,
+а при утечке отзови через `/revoke` у BotFather.
 
-Two machines. The watcher runs at home, where Telegram is blocked, so the Bot
-API calls are tunnelled through a VPS that can reach it. Apple is always
-fetched directly from the watcher — only Telegram takes the detour.
+## Структура развёртывания
+
+Две машины. Наблюдатель работает дома, где Telegram заблокирован, поэтому
+вызовы Bot API идут туннелем через VPS, которая до него достаёт. Запросы к
+Apple всегда уходят напрямую — в обход едет только Telegram.
 
 ```
-  MacBook (dev)                     watcher host                    proxy host
+  MacBook (разработка)              наблюдатель                     прокси
   ~/pupazalupa                      NanoPi R4S                      VPS
                                     37.204.22.209                   188.213.0.80
   ┌──────────────┐                 ┌─────────────────────┐        ┌──────────────────┐
-  │ git, deploy  │   ssh :2222     │ docker              │        │ tinyproxy        │
-  │ script, .env │ ──────────────▶ │  apple-duo-watch    │        │ 127.0.0.1:8888   │
+  │ git, деплой, │   ssh :2222     │ docker              │        │ tinyproxy        │
+  │ .env         │ ──────────────▶ │  apple-duo-watch    │        │ 127.0.0.1:8888   │
   └──────────────┘   duo_deploy    │                     │        └────────▲─────────┘
                                    │ telegram-tunnel     │  ssh :22        │
                                    │  172.17.0.1:8888 ───┼────────────────▶┘
                                    └──────┬──────────────┘  tunnel_to_vps
                                           │
-                        apple.com/ae ◀────┤ direct, no proxy
-                        ntfy.sh     ◀─────┘ direct, fallback channel
+                        apple.com/ae ◀────┤ напрямую, без прокси
+                        ntfy.sh     ◀─────┘ напрямую, запасной канал
 ```
 
-### Watcher host — NanoPi R4S
+### Наблюдатель — NanoPi R4S
 
 | | |
 |---|---|
-| Hostname | `nanopi-r4s` |
-| OS | Armbian 26.8.1 (Ubuntu 26.04 "resolute"), aarch64 |
-| Resources | 3.8 GB RAM, 55 GB free of 57 GB |
-| Network | `37.204.22.209`, LAN `192.168.0.111` behind `192.168.0.1` on `end0` |
-| SSH | port **2222**, `root`, key `~/.ssh/duo_deploy` |
-| Docker | `docker.io` 29.1.3, `docker-compose-v2` 2.40.3, both enabled at boot |
-| Service | container `apple-duo-watch`, `restart: unless-stopped` |
-| State | volume `apple-duo-watch_duo-state` mounted at `/data/state.json` |
-| Tunnel | `telegram-tunnel.service`, enabled, key `/root/.ssh/tunnel_to_vps` |
-| Files | `/opt/apple-duo-watch/` — `watcher.py`, `Dockerfile`, `docker-compose.yml`, `.env` |
+| Хост | `nanopi-r4s` |
+| ОС | Armbian 26.8.1 (Ubuntu 26.04 «resolute»), aarch64 |
+| Ресурсы | 3,8 ГБ RAM, 55 ГБ свободно из 57 ГБ |
+| Сеть | `37.204.22.209`, в локальной сети `192.168.0.111` за `192.168.0.1` на `end0` |
+| SSH | порт **2222**, `root`, ключ `~/.ssh/duo_deploy` |
+| Docker | `docker.io` 29.1.3, `docker-compose-v2` 2.40.3, оба в автозапуске |
+| Сервис | контейнер `apple-duo-watch`, `restart: unless-stopped` |
+| Состояние | volume `apple-duo-watch_duo-state`, смонтирован в `/data/state.json` |
+| Туннель | `telegram-tunnel.service`, в автозапуске, ключ `/root/.ssh/tunnel_to_vps` |
+| Файлы | `/opt/apple-duo-watch/` — `watcher.py`, `Dockerfile`, `docker-compose.yml`, `.env` |
 
-Docker came from the Ubuntu archive rather than `get.docker.com`: that script
-aborts here because the Armbian mirror (`apt.armbian.com`) times out, which
-makes its `apt-get update` fail.
+Docker поставлен из архива Ubuntu, а не скриптом `get.docker.com`: тот скрипт
+здесь падает, потому что зеркало Armbian (`apt.armbian.com`) отваливается по
+таймауту и его `apt-get update` возвращает ошибку.
 
-### Proxy host — VPS
+### Прокси — VPS
 
 | | |
 |---|---|
-| Hostname | `qwertjklk.com` |
-| OS | Ubuntu 24.04 LTS, x86_64 |
-| Resources | 14.7 GB disk |
-| Network | `188.213.0.80` |
-| SSH | port **22**, `root`, key `~/.ssh/duo_tunnel` |
-| Service | `tinyproxy` on `127.0.0.1:8888`, enabled, loopback only |
-| Purpose | reaches `api.telegram.org`, which the watcher host cannot |
+| Хост | `qwertjklk.com` |
+| ОС | Ubuntu 24.04 LTS, x86_64 |
+| Ресурсы | 14,7 ГБ диска |
+| Сеть | `188.213.0.80` |
+| SSH | порт **22**, `root`, ключ `~/.ssh/duo_tunnel` |
+| Сервис | `tinyproxy` на `127.0.0.1:8888`, в автозапуске, только loopback |
+| Назначение | достаёт `api.telegram.org`, недоступный с машины-наблюдателя |
 
-Its `authorized_keys` holds three entries: the admin key from the MacBook, the
-MacBook's own default key, and the watcher's key restricted to the single
-forward it needs.
+В `authorized_keys` три записи: админский ключ с MacBook, обычный ключ того же
+MacBook и ключ наблюдателя, ограниченный единственным нужным ему форвардом.
 
-Nothing on this host listens publicly except SSH — tinyproxy is bound to
-loopback, so the proxy is reachable only from inside the tunnel. Password
-login is off (`/etc/ssh/sshd_config.d/00-hardening.conf`); the `00-` prefix
-matters, because sshd takes the first value it reads and cloud-init ships a
-`50-cloud-init.conf` that re-enables `PasswordAuthentication`. Verify with
-`sshd -T | grep passwordauthentication` rather than trusting the file.
+Публично на этой машине не слушает ничего, кроме SSH: tinyproxy привязан к
+loopback, так что прокси доступен только изнутри туннеля. Вход по паролю
+отключён (`/etc/ssh/sshd_config.d/00-hardening.conf`). Префикс `00-` важен:
+sshd берёт первое прочитанное значение, а cloud-init кладёт свой
+`50-cloud-init.conf`, который возвращает `PasswordAuthentication yes`.
+Проверять нужно через `sshd -T | grep passwordauthentication`, а не по файлу.
 
-### Keys
+### Ключи
 
-| Key | From | To | Scope |
+| Ключ | Откуда | Куда | Права |
 |---|---|---|---|
-| `~/.ssh/duo_deploy` | MacBook | NanoPi :2222 | full root, deploys |
-| `~/.ssh/duo_tunnel` | MacBook | VPS :22 | full root, admin |
-| `~/.ssh/id_ed25519` | MacBook | VPS :22 | full root, your own login |
-| `/root/.ssh/tunnel_to_vps` | NanoPi | VPS :22 | `permitopen` 127.0.0.1:8888, no shell |
+| `~/.ssh/duo_deploy` | MacBook | NanoPi :2222 | полный root, деплой |
+| `~/.ssh/duo_tunnel` | MacBook | VPS :22 | полный root, администрирование |
+| `~/.ssh/id_ed25519` | MacBook | VPS :22 | полный root, твой обычный вход |
+| `/root/.ssh/tunnel_to_vps` | NanoPi | VPS :22 | `permitopen` 127.0.0.1:8888, без шелла |
 
-## Run it
+## Как запускать
 
-### Docker (recommended on a server)
+### Docker — основной способ на сервере
 
 ```sh
-cp .env.example .env     # then edit: add the bot token
+cp .env.example .env     # затем отредактировать: вписать токен бота
 docker compose up -d --build
 docker compose logs -f
 ```
 
-State survives restarts in the `duo-state` volume.
+Состояние переживает перезапуски в volume `duo-state`.
 
-### On a server over SSH
+### На сервер по SSH
 
-From this checkout, with `.env` filled in:
-
-```sh
-./deploy/remote-install.sh -p 2222 -i ~/.ssh/duo_deploy root@your-host
-```
-
-`-p` is the SSH port (default 22) and `-i` the key to authenticate with. The
-script copies `watcher.py`, the Dockerfile, the compose file and `.env` to
-`/opt/apple-duo-watch`, installs Docker if the host has none, and runs
-`docker compose up -d --build`. Re-run the same command to deploy an update.
-Nothing is cloned on the server, so it needs no GitHub credentials.
-
-The key has to be authorized on the host first — once, from your machine,
-typing the server password yourself:
+Из этого рабочего каталога, с заполненным `.env`:
 
 ```sh
-ssh-copy-id -p 2222 -i ~/.ssh/duo_deploy.pub root@your-host
+./deploy/remote-install.sh -p 2222 -i ~/.ssh/duo_deploy root@37.204.22.209
 ```
 
-### systemd (no Docker)
+`-p` — порт SSH (по умолчанию 22), `-i` — ключ. Скрипт копирует `watcher.py`,
+Dockerfile, compose-файл и `.env` в `/opt/apple-duo-watch`, доставляет Docker,
+если его нет, и выполняет `docker compose up -d --build`. Повторный запуск той
+же команды — это и есть обновление. На сервере ничего не клонируется, поэтому
+доступ к приватному репозиторию ему не нужен.
+
+Ключ должен быть заранее авторизован на хосте — один раз, со своей машины, с
+вводом пароля сервера вручную:
+
+```sh
+ssh-copy-id -p 2222 -i ~/.ssh/duo_deploy.pub root@твой-хост
+```
+
+### systemd, без Docker
 
 ```sh
 sudo useradd --system --home /opt/apple-duo-watch duo
@@ -170,81 +172,82 @@ sudo systemctl enable --now apple-duo-watch
 journalctl -u apple-duo-watch -f
 ```
 
-### Locally on macOS
+### Локально на macOS
 
-`deploy/com.appleduo.watch.plist` is a launchd agent — it keeps running when the
-Claude app is closed, unlike a scheduled task in the app.
+`deploy/com.appleduo.watch.plist` — агент launchd: работает и при закрытом
+приложении Claude, в отличие от задачи по расписанию внутри приложения.
 
 ```sh
 cp deploy/com.appleduo.watch.plist ~/Library/LaunchAgents/
 launchctl load -w ~/Library/LaunchAgents/com.appleduo.watch.plist
 ```
 
-### One-off checks
+### Разовые проверки
 
 ```sh
-python3 -I watcher.py --show     # table of all eight SKUs right now
-python3 -I watcher.py --once     # one pass, report changes, exit
+python3 -I watcher.py --show     # таблица по всем восьми конфигурациям сейчас
+python3 -I watcher.py --once     # один проход, сообщить изменения, выйти
 ```
 
-## Configuration
+## Настройки
 
-Every setting is an environment variable, documented in `.env.example`:
+Всё задаётся переменными окружения, они описаны в `.env.example`:
 `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `TELEGRAM_PROXY`, `NTFY_URL`,
 `NTFY_TOKEN`, `INTERVAL_SECONDS`, `PICKUP_EVERY`, `CITY`, `ALERT_BEFORE`,
-`ONLY_PARTS`, `STATE_FILE`. CLI flags of the same name win over the
-environment.
+`ONLY_PARTS`, `STATE_FILE`. Одноимённые флаги командной строки важнее
+окружения.
 
-## When Telegram is blocked on the watcher's network
+## Когда Telegram заблокирован в сети наблюдателя
 
-The deployment this repo was written for sits on a Russian home ISP, where
-`api.telegram.org`, `core.telegram.org` and `t.me` do not accept TCP at all
-(DNS resolves fine, so the filtering is by IP), while Apple, GitHub and
-everything else is reachable. Two pieces handle that:
+Развёртывание, под которое написан этот репозиторий, стоит на домашнем
+российском провайдере, где `api.telegram.org`, `core.telegram.org` и `t.me`
+вообще не принимают TCP — DNS при этом отвечает нормально, то есть фильтрация
+идёт по IP, — тогда как Apple, GitHub и всё остальное доступно. За это отвечают
+две вещи:
 
-- `TELEGRAM_PROXY` sends **only** the Bot API calls through an HTTP proxy.
-  Apple is always fetched directly, so nothing else rides the tunnel.
-- `deploy/telegram-tunnel.service` keeps an SSH tunnel to a VPS outside that
-  network, exposing the VPS's loopback-only tinyproxy on the docker bridge
-  (`172.17.0.1:8888`) where the container can reach it. The transport is SSH,
-  so a DPI box sees a connection to the VPS and nothing about Telegram.
+- `TELEGRAM_PROXY` отправляет через HTTP-прокси **только** вызовы Bot API.
+  К Apple запросы всегда идут напрямую, так что в туннель не попадает лишнее.
+- `deploy/telegram-tunnel.service` держит SSH-туннель до VPS вне этой сети и
+  выставляет её loopback-прокси на docker-бридж (`172.17.0.1:8888`), откуда
+  его видит контейнер. Транспорт — SSH, поэтому DPI видит соединение с VPS и
+  ничего не знает про Telegram.
 
-On the VPS, tinyproxy listens on `127.0.0.1:8888` only, and the tunnel key is
-restricted in `authorized_keys` to that one forward with no shell:
+На VPS tinyproxy слушает только `127.0.0.1:8888`, а ключ туннеля ограничен в
+`authorized_keys` одним этим форвардом и без шелла:
 
 ```
 restrict,port-forwarding,permitopen="127.0.0.1:8888",command="/bin/false" ssh-ed25519 …
 ```
 
-`NTFY_URL` adds a second channel for when the tunnel itself is down. A change
-that reaches no channel is not marked as seen, so the next check reports it
-again rather than losing it — but a second channel still gets the alert out
-sooner.
+`NTFY_URL` добавляет второй канал на случай, когда упал сам туннель. Находка,
+которую не принял ни один канал, не помечается как увиденная, так что
+следующая проверка сообщит о ней снова, — но второй канал всё равно доставит
+уведомление быстрее.
 
-## Polling rate
+## Частота опроса
 
-The deployment runs at `INTERVAL_SECONDS=10`. That is deliberately aggressive,
-and the trade-off is worth stating plainly: a freed pre-order slot can be gone
-within a minute, so a short interval is the point — but Apple rate-limits by
-source IP, and a block makes the watcher blind, which is strictly worse than a
-slower poll. Four things keep that risk down:
+Развёртывание работает на `INTERVAL_SECONDS=10`. Это сознательно агрессивно, и
+компромисс стоит назвать прямо: освободившийся слот предзаказа может исчезнуть
+в пределах минуты, поэтому короткий интервал — это и есть смысл затеи. Но Apple
+ограничивает по исходному IP, а блокировка делает наблюдателя слепым, что
+строго хуже редкого опроса. Риск снижают четыре вещи:
 
-- Each cycle subtracts its own request time from the wait, so the period is the
-  interval itself rather than the interval plus however long Apple took.
-- Up to 15% random jitter per tick, so the traffic does not look like a
-  metronome.
-- The in-store pickup lookup is a second request, so it runs every Nth cycle —
-  about once a minute at any interval, via `PICKUP_EVERY`. At 10 seconds that
-  is one request per cycle instead of two.
-- Failures back off exponentially to 15 minutes instead of hammering through a
-  block, and the service warns at startup whenever the interval is under 30
-  seconds.
+- Каждый цикл вычитает из паузы время собственного запроса, поэтому период
+  равен интервалу, а не интервалу плюс время ответа Apple.
+- До 15% случайного разброса на каждый тик, чтобы трафик не выглядел
+  метрономом.
+- Запрос самовывоза — второй запрос за цикл, поэтому он выполняется раз в N
+  циклов: примерно раз в минуту при любом интервале, через `PICKUP_EVERY`. На
+  10 секундах это один запрос за цикл вместо двух.
+- Ошибки уходят в экспоненциальный backoff до 15 минут, а не продолжают
+  долбить сквозь блокировку. При интервале меньше 30 секунд сервис
+  предупреждает об этом на старте.
 
-One of Apple's availability endpoints already answers `541` to plain scripted
-requests, so the limits are real rather than theoretical. If the logs start
-showing `apple unreachable` in runs, raise the interval.
+Один из endpoint'ов Apple уже отвечает `541` на простые скриптовые запросы,
+так что ограничения здесь реальные, а не теоретические. Если в логах начнут
+появляться `apple unreachable` — поднимай интервал.
 
-## Scope
+## Границы
 
-No purchase, no checkout, no card details, no account actions — the service only
-reads public availability endpoints and sends you a link.
+Никаких покупок, оформления заказа, карточных данных и действий с аккаунтом:
+сервис только читает публичные endpoint'ы наличия и присылает тебе ссылку.
