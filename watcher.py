@@ -361,6 +361,19 @@ class Telegram:
     def enabled(self):
         return bool(self.token)
 
+    # Telegram sends chat ids as numbers, the environment hands them over as
+    # text, and the state file keeps whichever was stored last. Normalising on
+    # every assignment is the whole fix for a comparison that silently dropped
+    # every message the owner sent: 1423567839 != "1423567839".
+    @property
+    def chat_id(self):
+        return self._chat_id
+
+    @chat_id.setter
+    def chat_id(self, value):
+        text = "" if value is None else str(value).strip()
+        self._chat_id = text or None
+
     def _call(self, method, **params):
         if not self.token:
             return None
@@ -417,8 +430,8 @@ class Telegram:
             msg = upd.get("message") or {}
             chat = (msg.get("chat") or {}).get("id")
             text = (msg.get("text") or "").strip()
-            if chat and text:
-                out.append((chat, text))
+            if chat is not None and text:
+                out.append((str(chat), text))
         return out
 
 
@@ -991,6 +1004,10 @@ def handle_commands(rt, tg):
             # nothing at all — not even that the command exists.
             log.warning("ignoring /%s from chat %s", cmd, chat_id)
             continue
+        # Logged so that /log alone shows whether a command ever arrived and
+        # was accepted — the symptom of the chat_id mismatch was silence, and
+        # silence is the one thing a log should never leave ambiguous.
+        log.info("command /%s from the owner", cmd)
         state = load_state(cfg.state_file)
 
         if cmd in ("start", "status"):
