@@ -48,9 +48,11 @@ docker --version && docker compose version'
 
 echo "==> copying service files to $REMOTE_DIR"
 ssh_run "mkdir -p '$REMOTE_DIR'"
-rsync -az --chmod=F600 -e "ssh ${SSH_OPTS[*]}" \
+# No --chmod here: the rsync macOS ships with does not support it.
+rsync -az -e "ssh ${SSH_OPTS[*]}" \
   "$HERE/watcher.py" "$HERE/Dockerfile" "$HERE/docker-compose.yml" "$HERE/.env" \
   "$TARGET:$REMOTE_DIR/"
+ssh_run "chmod 600 '$REMOTE_DIR/.env'"
 
 echo "==> building and starting"
 ssh_run "cd '$REMOTE_DIR' && docker compose up -d --build"
