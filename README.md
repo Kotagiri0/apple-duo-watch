@@ -110,7 +110,11 @@ MacBook's own default key, and the watcher's key restricted to the single
 forward it needs.
 
 Nothing on this host listens publicly except SSH — tinyproxy is bound to
-loopback, so the proxy is reachable only from inside the tunnel.
+loopback, so the proxy is reachable only from inside the tunnel. Password
+login is off (`/etc/ssh/sshd_config.d/00-hardening.conf`); the `00-` prefix
+matters, because sshd takes the first value it reads and cloud-init ships a
+`50-cloud-init.conf` that re-enables `PasswordAuthentication`. Verify with
+`sshd -T | grep passwordauthentication` rather than trusting the file.
 
 ### Keys
 
