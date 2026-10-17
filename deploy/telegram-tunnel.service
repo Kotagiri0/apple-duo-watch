@@ -7,8 +7,10 @@ Wants=network-online.target
 [Service]
 Type=simple
 # Binds on the docker bridge so containers can use the proxy; the VPS side
-# listens on loopback only, so nothing is exposed to the internet.
-ExecStart=/usr/bin/ssh -N -T -i /root/.ssh/tunnel_to_vps -o IdentitiesOnly=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o ConnectTimeout=20 -o StrictHostKeyChecking=yes -L 172.17.0.1:8888:127.0.0.1:8888 root@188.213.0.80
+# listens on loopback only, so nothing is exposed to the internet. 8888 is the
+# proxy for Telegram, 8899 the heartbeat sink the outside watchdog watches;
+# both ports must be in the key's permitopen list on the VPS.
+ExecStart=/usr/bin/ssh -N -T -i /root/.ssh/tunnel_to_vps -o IdentitiesOnly=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o ConnectTimeout=20 -o StrictHostKeyChecking=yes -L 172.17.0.1:8888:127.0.0.1:8888 -L 172.17.0.1:8899:127.0.0.1:8899 root@188.213.0.80
 Restart=always
 RestartSec=10
 

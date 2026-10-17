@@ -21,6 +21,15 @@ Configuration comes from the environment (see .env.example):
   PICKUP_EVERY         check in-store pickup every Nth cycle instead of all of
                        them; defaults to roughly once a minute, which keeps a
                        short INTERVAL_SECONDS from doubling the request rate
+  BLIND_AFTER_SECONDS  warn that the watcher went blind after this many seconds
+                       of unbroken failure (default 600); one alert per
+                       incident, plus one when it clears
+  HEALTHCHECK_URL      outside watchdog pinged after every successful cycle,
+                       so that something notices if this process dies or the
+                       machine goes off, which no in-process alarm can
+  HEALTHCHECK_EVERY_SECONDS
+                       at most one healthcheck ping per this many seconds
+                       (default 60), so a 10s interval does not hammer it
 """
 import argparse
 import datetime as dt
@@ -66,6 +75,44 @@ log = logging.getLogger("duo")
 
 class AppleUnreachable(RuntimeError):
     """Apple did not answer, or answered with something we cannot parse."""
+
+
+# ---------------------------------------------------------------- helpers
+
+def now_iso():
+    return dt.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def parse_iso(text):
+    """A stamp written by now_iso(), or None. Always timezone-aware."""
+    try:
+        when = dt.datetime.fromisoformat(text)
+    except (TypeError, ValueError):
+        return None
+    return when.astimezone() if when.tzinfo is None else when
+
+
+def ago(iso, now=None):
+    """'2026-10-17T21:03:11+04:00' -> '3 мин назад'."""
+    when = parse_iso(iso)
+    if when is None:
+        return "никогда"
+    secs = max(0, int(((now or dt.datetime.now().astimezone())
+                       - when).total_seconds()))
+    if secs < 90:
+        return f"{secs} с назад"
+    if secs < 90 * 60:
+        return f"{secs // 60} мин назад"
+    if secs < 48 * 3600:
+        return f"{secs // 3600} ч назад"
+    return f"{secs // 86400} дн назад"
+
+
+def esc(text):
+    """Telegram's HTML mode rejects stray angle brackets, and the error strings
+    we quote back are full of them ("<urlopen error [Errno -3] ...>")."""
+    return (str(text).replace("&", "&amp;")
+            .replace("<", "&lt;").replace(">", "&gt;"))
 
 
 # ---------------------------------------------------------------- Apple store
@@ -239,6 +286,10 @@ class Telegram:
         self.offset = None
         self.proxy = proxy
         self._fail_streak = 0
+        # The watchdog reads these: getUpdates runs every cycle, so the last
+        # call's outcome is a live check of the proxy and the tunnel.
+        self.last_ok = None
+        self.last_error = None
         # A proxy here must not touch the Apple requests, so Telegram gets its
         # own opener instead of the process-wide default.
         handlers = [urllib.request.ProxyHandler(
@@ -260,16 +311,23 @@ class Telegram:
             with self.opener.open(req, timeout=60) as r:
                 out = json.loads(r.read().decode("utf-8"))
             self._fail_streak = 0
+            self.last_ok = now_iso()
+            self.last_error = None
             return out
         except (urllib.error.URLError, urllib.error.HTTPError, ValueError,
                 TimeoutError) as e:
             # On a network that blocks api.telegram.org every call fails, so
             # the first failure and then every 30th are logged, not all of them.
             self._fail_streak += 1
+            self.last_error = str(e)
             if self._fail_streak == 1 or self._fail_streak % 30 == 0:
                 log.warning("telegram %s failed (%d in a row): %s",
                             method, self._fail_streak, e)
             return None
+
+    @property
+    def fail_streak(self):
+        return self._fail_streak
 
     def send(self, html, text=None):
         if not self.chat_id:
@@ -327,6 +385,62 @@ class Ntfy:
             return False
 
 
+class Healthcheck:
+    """Ping an outside watchdog after every successful cycle.
+
+    Everything else here runs inside this process, so none of it can speak up
+    when the process itself is gone, the container is down or the NanoPi is
+    off. A dead man's switch outside the house can: it alerts when the pings
+    stop. Posted to directly, never through TELEGRAM_PROXY, because the
+    network that blocks Telegram reaches ntfy and the healthcheck services.
+    """
+
+    def __init__(self, url, every=60):
+        self.url = (url or "").strip()
+        self.every = max(0, int(every))
+        self.last_sent = None      # monotonic, for the rate limit
+        self.last_ok = None        # wall clock, for /health
+        self.fail_streak = 0
+
+    @property
+    def enabled(self):
+        return bool(self.url)
+
+    @property
+    def host(self):
+        """Only the host: a ping URL carries a UUID or an ntfy topic name."""
+        return urllib.parse.urlsplit(self.url).netloc or "?"
+
+    def ping(self, note=""):
+        """One ping, at most one per `every` seconds. True if it landed."""
+        if not self.url:
+            return False
+        now = time.monotonic()
+        if self.last_sent is not None and now - self.last_sent < self.every:
+            return False
+        self.last_sent = now
+        headers = {"Content-Type": "text/plain; charset=utf-8",
+                   "Title": "apple-duo-watch heartbeat"}
+        try:
+            req = urllib.request.Request(
+                self.url, data=(note or "ok").encode("utf-8"), headers=headers)
+            with urllib.request.urlopen(req, timeout=20) as r:
+                ok = 200 <= r.status < 300
+        except (urllib.error.URLError, urllib.error.HTTPError, ValueError,
+                TimeoutError) as e:
+            self.fail_streak += 1
+            # Same throttle as Telegram: a healthcheck host that has gone away
+            # would otherwise fill the log with one line per cycle.
+            if self.fail_streak == 1 or self.fail_streak % 30 == 0:
+                log.warning("healthcheck ping failed (%d in a row): %s",
+                            self.fail_streak, e)
+            return False
+        if ok:
+            self.fail_streak = 0
+            self.last_ok = now_iso()
+        return ok
+
+
 def announce(notifiers, html, text):
     """Fan an alert out to every configured channel. Returns how many took it."""
     sent = 0
@@ -334,6 +448,153 @@ def announce(notifiers, html, text):
         if n.enabled and n.send(html, text):
             sent += 1
     return sent
+
+
+# ----------------------------------------------------------------- watchdog
+
+# "Nothing changed" and "nothing is seen any more" look identical from the
+# outside: both are silence. Everything below is about telling them apart.
+
+HEALTH_SUBJECTS = {
+    "apple": ("магазин Apple", "🙈", "👀"),
+    "telegram": ("Telegram", "🙉", "📨"),
+}
+
+
+def render_health_alert(kind, subject, entry, blind_for, html=True):
+    name, blind_icon, back_icon = HEALTH_SUBJECTS.get(
+        subject, (subject, "🚨", "✅"))
+    if kind == "back":
+        since = entry.get("failing_since")
+        return (f"{back_icon} Снова вижу {name}."
+                + (f"\nНе отвечал с {since}." if since else ""))
+    error = entry.get("last_error") or "без описания"
+    head = f"<b>Не вижу {name}</b>" if html else f"Не вижу {name}"
+    hint = ("Пока это так, об изменениях в магазине я не узнаю: проверь "
+            "контейнер и не забанил ли Apple исходящий IP."
+            if subject == "apple" else
+            "Находки пока доходят только во второй канал: проверь "
+            "telegram-tunnel.service и прокси.")
+    return (f"{blind_icon} {head}\n"
+            f"Неудач подряд: {entry.get('fail_streak', 0)}, "
+            f"с {entry.get('failing_since')} (≈{int(blind_for // 60)} мин).\n"
+            f"Ошибка: {esc(error) if html else error}\n{hint}")
+
+
+class Watchdog:
+    """Say it once when something stays broken, and once when it recovers.
+
+    The trigger is `after` seconds of unbroken failure rather than a number of
+    cycles, so the backoff cannot stretch it. The streak lives in the state
+    file, so a restart neither forgets an open incident nor opens a second one.
+    An alert no channel accepted is not marked as sent, the same way a finding
+    nobody took is not marked as seen.
+    """
+
+    # A healthy cycle changes nothing but last_ok, and at a 10s interval
+    # saving that every time would triple the writes this service makes to an
+    # SD card for no gain. Quiet cycles are written at most this often.
+    QUIET_WRITE_EVERY = 60
+
+    def __init__(self, state_file, after):
+        self.state_file = state_file
+        self.after = max(1, int(after))
+        self.written = {}
+
+    def record(self, subject, ok, reason=None, notifiers=()):
+        state = load_state(self.state_file)
+        entry = state.setdefault("health", {}).setdefault(subject, {})
+        was_failing = bool(entry.get("fail_streak") or entry.get("failing_since"))
+        now = dt.datetime.now().astimezone()
+        alert = None
+
+        if ok:
+            entry["last_ok"] = now.isoformat(timespec="seconds")
+            entry["fail_streak"] = 0
+            if entry.get("alerted"):
+                # Keep failing_since and last_error until the "ok again"
+                # message is actually delivered: it quotes them.
+                alert = ("back", 0.0)
+            else:
+                entry.pop("failing_since", None)
+                entry.pop("last_error", None)
+        else:
+            entry["fail_streak"] = entry.get("fail_streak", 0) + 1
+            if reason is not None:
+                entry["last_error"] = str(reason)[:300]
+            since = entry.get("failing_since")
+            if not since:
+                entry["failing_since"] = since = now.isoformat(timespec="seconds")
+            blind_for = max(0.0, (now - (parse_iso(since) or now)).total_seconds())
+            if blind_for >= self.after and not entry.get("alerted"):
+                alert = ("blind", blind_for)
+
+        if alert:
+            kind, blind_for = alert
+            delivered = announce(
+                notifiers,
+                render_health_alert(kind, subject, entry, blind_for),
+                render_health_alert(kind, subject, entry, blind_for, html=False))
+            if delivered:
+                log.warning("watchdog: %s is %s, told %d channel(s)",
+                            subject, kind, delivered)
+                if kind == "blind":
+                    entry["alerted"] = True
+                else:
+                    entry.pop("alerted", None)
+                    entry.pop("failing_since", None)
+                    entry.pop("last_error", None)
+            else:
+                log.warning("watchdog: %s is %s but no channel took it; "
+                            "retrying next cycle", subject, kind)
+
+        quiet = ok and alert is None and not was_failing
+        age = time.monotonic() - self.written.get(subject, float("-inf"))
+        if not quiet or age >= self.QUIET_WRITE_EVERY:
+            save_state(self.state_file, state)
+            self.written[subject] = time.monotonic()
+        return alert
+
+
+def render_health(cfg, tg, hc, html=True):
+    """Answer for /health: when the store was last seen, and by which path."""
+    state = load_state(cfg.state_file)
+    health = state.get("health") or {}
+    apple = health.get("apple") or {}
+    checked_at = state.get("checked_at")
+    lines = ["<b>Самочувствие наблюдателя</b>" if html
+             else "Самочувствие наблюдателя"]
+
+    lines.append(f"🛒 Магазин Apple: удачная проверка {ago(checked_at)}"
+                 + (f" ({checked_at})" if checked_at else ""))
+    streak = apple.get("fail_streak") or 0
+    if streak:
+        err = apple.get("last_error") or "без описания"
+        lines.append(f"⚠️ Неудач подряд: {streak}, с "
+                     f"{apple.get('failing_since')} — "
+                     f"{esc(err) if html else err}")
+    else:
+        lines.append("✅ Неудач подряд: 0")
+    lines.append(f"⏱ Порог тревоги: {cfg.blind_after} с непрерывных неудач")
+
+    if tg and tg.enabled:
+        tgh = health.get("telegram") or {}
+        route = f"через прокси {tg.proxy}" if tg.proxy else "напрямую"
+        tstreak = tgh.get("fail_streak") or 0
+        lines.append(f"{'✅' if not tstreak else '⚠️'} Telegram {route}: "
+                     f"ответ {ago(tgh.get('last_ok'))}, неудач подряд "
+                     f"{tstreak}")
+        # This very message came through the tunnel, so it is up right now.
+        lines.append("    (раз это сообщение дошло — туннель жив)")
+
+    if hc and hc.enabled:
+        lines.append(f"{'✅' if not hc.fail_streak else '⚠️'} Внешний "
+                     f"healthcheck {hc.host}: пинг {ago(hc.last_ok)}, "
+                     f"неудач подряд {hc.fail_streak}")
+    else:
+        lines.append("➖ Внешнего healthcheck нет (HEALTHCHECK_URL пуст): "
+                     "если процесс умрёт целиком, сказать об этом будет некому")
+    return "\n".join(lines)
 
 
 # ------------------------------------------------------------------ service
@@ -397,7 +658,7 @@ def check_once(cfg, notifiers, notify=True, with_pickup=True):
                   for pn, p in previous.items() if p.get("pickup")}
     events = diff(previous, current, pickup, cfg.parts, cfg.threshold)
 
-    checked_at = dt.datetime.now().astimezone().isoformat(timespec="seconds")
+    checked_at = now_iso()
     state["checked_at"] = checked_at
     if tg and tg.chat_id:
         state["chat_id"] = tg.chat_id
@@ -437,14 +698,17 @@ def check_once(cfg, notifiers, notify=True, with_pickup=True):
             log.warning("found %d change(s) but no channel accepted them; "
                         "keeping the previous state so the next check retries",
                         len(events))
+            # The new dates stay unrecorded, but the fact that Apple answered
+            # is saved: checked_at is what says the watcher is not blind.
+            save_state(cfg.state_file, state)
             return events, current, pickup
 
     persist()
     return events, current, pickup
 
 
-def handle_commands(cfg, tg, last):
-    """Answer /start, /status, /help. Adopts the first chat if none configured."""
+def handle_commands(cfg, tg, last, hc=None):
+    """Answer /start, /status, /health, /help. Adopts the first chat if none."""
     for chat_id, text in tg.poll_commands():
         cmd = text.split()[0].lower().lstrip("/").split("@")[0]
         if tg.chat_id is None:
@@ -461,14 +725,18 @@ def handle_commands(cfg, tg, last):
                 tg.send(render_status(current, cfg.parts, pickup, checked_at))
             else:
                 tg.send("Ещё не делал первую проверку, подожди минуту.")
+        elif cmd == "health":
+            tg.send(render_health(cfg, tg, hc))
         elif cmd == "help":
             tg.send("/status — текущие даты отправки по всем конфигурациям\n"
+                    "/health — когда был последний удачный опрос, сколько "
+                    "неудач подряд, жив ли туннель\n"
                     "/help — это сообщение\n\n"
                     "Сам я ничего не покупаю: присылаю ссылку, "
                     "оплату подтверждаешь ты.")
 
 
-def serve(cfg, notifiers):
+def serve(cfg, notifiers, wd, hc):
     tg = next((n for n in notifiers if isinstance(n, Telegram)), None)
     stop = {"now": False}
 
@@ -486,6 +754,9 @@ def serve(cfg, notifiers):
                    else f"{cfg.city} every {cfg.pickup_every} cycles")
     log.info("watching %d SKUs every %ds (pickup=%s, channels=%s)",
              len(cfg.parts), cfg.interval, pickup_note or "off", channels)
+    log.info("watchdog: alerting after %ds of unbroken failure; heartbeat=%s",
+             cfg.blind_after,
+             f"{hc.host} every {hc.every}s" if hc.enabled else "off")
 
     last = ({}, {}, "")
     backoff = 0
@@ -496,26 +767,36 @@ def serve(cfg, notifiers):
             events, current, pickup = check_once(
                 cfg, notifiers, with_pickup=(cycle % cfg.pickup_every == 0))
             cycle += 1
-            last = (current, pickup,
-                    dt.datetime.now().astimezone().isoformat(timespec="seconds"))
+            last = (current, pickup, now_iso())
             backoff = 0
+            earliest = min((p["date"] for p in current.values()
+                            if p.get("date")), default=None)
             if not events:
-                earliest = min((p["date"] for p in current.values()
-                                if p.get("date")), default=None)
                 log.info("ok — %d SKUs, earliest ship date %s",
                          len(current), earliest)
+            wd.record("apple", True, notifiers=notifiers)
+            # Proof of life for something outside this process, which is the
+            # only thing that can speak up once this process is gone.
+            hc.ping(f"{len(current)} SKUs, earliest {earliest}")
         except AppleUnreachable as e:
             backoff = min(backoff * 2 or cfg.interval, 900)
             log.warning("apple unreachable (%s); backing off %ds", e, backoff)
-        except Exception:                              # keep the service alive
+            wd.record("apple", False, e, notifiers=notifiers)
+        except Exception as e:                         # keep the service alive
             log.exception("unexpected error in check loop")
             backoff = min(backoff * 2 or cfg.interval, 900)
+            wd.record("apple", False, e, notifiers=notifiers)
 
         if tg and tg.enabled:
             try:
-                handle_commands(cfg, tg, last)
+                handle_commands(cfg, tg, last, hc)
             except Exception:
                 log.exception("command handling failed")
+            # getUpdates ran just now, so its outcome is a live check of the
+            # proxy and the tunnel. Nothing else here would notice them going
+            # away: without a finding to deliver, Telegram is never called.
+            wd.record("telegram", tg.fail_streak == 0, tg.last_error,
+                      notifiers=notifiers)
 
         # Subtract the work already done, so the cycle period is the interval
         # rather than interval plus however long Apple took to answer.
@@ -554,9 +835,17 @@ class Config:
         every = args.pickup_every or os.environ.get("PICKUP_EVERY")
         self.pickup_every = max(1, int(every)) if every else max(
             1, round(60 / self.interval))
+        self.blind_after = int(args.blind_after
+                               or os.environ.get("BLIND_AFTER_SECONDS") or 600)
+        self.healthcheck_url = (os.environ.get("HEALTHCHECK_URL") or "").strip()
+        self.healthcheck_every = int(
+            os.environ.get("HEALTHCHECK_EVERY_SECONDS") or 60)
         if self.interval < 30:
             log.warning("interval %ds is aggressive; Apple may rate-limit this "
                         "IP, which would make the watcher blind", self.interval)
+        if not self.healthcheck_url:
+            log.warning("HEALTHCHECK_URL is unset: an in-process watchdog "
+                        "cannot report that the process itself died")
 
 
 def main(argv=None):
@@ -573,6 +862,8 @@ def main(argv=None):
                     help="comma-separated part numbers to watch")
     ap.add_argument("--pickup-every", type=int, default=None, metavar="N",
                     help="look up in-store pickup every Nth cycle")
+    ap.add_argument("--blind-after", type=int, default=None, metavar="SECONDS",
+                    help="warn after this long without a successful check")
     args = ap.parse_args(argv)
 
     logging.basicConfig(
@@ -589,6 +880,8 @@ def main(argv=None):
     ntfy = Ntfy(os.environ.get("NTFY_URL", ""),
                 os.environ.get("NTFY_TOKEN", ""))
     notifiers = [tg, ntfy]
+    wd = Watchdog(cfg.state_file, cfg.blind_after)
+    hc = Healthcheck(cfg.healthcheck_url, cfg.healthcheck_every)
 
     if args.show:
         try:
@@ -609,15 +902,18 @@ def main(argv=None):
 
     if args.once:
         try:
-            events, _, _ = check_once(cfg, notifiers)
+            events, current, _ = check_once(cfg, notifiers)
         except AppleUnreachable as e:
+            wd.record("apple", False, e, notifiers=notifiers)
             print(f"apple unreachable: {e}", file=sys.stderr)
             return 1
+        wd.record("apple", True, notifiers=notifiers)
+        hc.ping(f"{len(current)} SKUs")
         if not events:
             log.info("no change")
         return 0
 
-    serve(cfg, notifiers)
+    serve(cfg, notifiers, wd, hc)
     return 0
 
 

@@ -3,3 +3,4 @@ state.json
 *.state.json
 __pycache__/
 *.pyc
+deploy/vps-deadman.env
