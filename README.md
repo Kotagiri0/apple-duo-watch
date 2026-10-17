@@ -69,14 +69,21 @@ State survives restarts in the `duo-state` volume.
 From this checkout, with `.env` filled in:
 
 ```sh
-./deploy/remote-install.sh user@your-host
+./deploy/remote-install.sh -p 2222 -i ~/.ssh/duo_deploy root@your-host
 ```
 
-It copies `watcher.py`, the Dockerfile, the compose file and `.env` to
-`/opt/apple-duo-watch` on the host and runs `docker compose up -d --build`.
-Re-run the same command to deploy an update. The server needs Docker with
-compose v2 and nothing else — no GitHub credentials, since the files are
-copied rather than cloned.
+`-p` is the SSH port (default 22) and `-i` the key to authenticate with. The
+script copies `watcher.py`, the Dockerfile, the compose file and `.env` to
+`/opt/apple-duo-watch`, installs Docker if the host has none, and runs
+`docker compose up -d --build`. Re-run the same command to deploy an update.
+Nothing is cloned on the server, so it needs no GitHub credentials.
+
+The key has to be authorized on the host first — once, from your machine,
+typing the server password yourself:
+
+```sh
+ssh-copy-id -p 2222 -i ~/.ssh/duo_deploy.pub root@your-host
+```
 
 ### systemd (no Docker)
 
