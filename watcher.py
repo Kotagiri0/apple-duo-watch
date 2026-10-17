@@ -354,6 +354,9 @@ class Telegram:
         # call's outcome is a live check of the proxy and the tunnel.
         self.last_ok = None
         self.last_error = None
+        # Everyone a finding goes to: the owner and the admins. Refreshed
+        # from the state file, so admitting someone takes effect at once.
+        self.recipients = []
         # A proxy here must not touch the Apple requests, so Telegram gets its
         # own opener instead of the process-wide default.
         handlers = [urllib.request.ProxyHandler(
@@ -407,20 +410,34 @@ class Telegram:
         return self._fail_streak
 
     def send(self, html, text=None, markup=None, to=None):
-        """Send to `to`, or to the owner's chat when it is not given.
+        """Send to `to`, or to every recipient when it is not given.
 
-        Replies go back to whoever asked, while findings keep going to the
-        owner: letting someone read the store is not the same as moving the
-        bot's notifications into their pocket.
+        A reply names its chat and goes only there; a finding names none and
+        reaches the owner and every admin. True if at least one of them took
+        it, which is what decides whether a finding counts as delivered: one
+        admin having blocked the bot must not make the rest lose the news.
         """
-        target = to if to is not None else self.chat_id
-        if not target:
+        if to is not None:
+            targets = [to]
+        else:
+            targets = self.recipients or ([self.chat_id] if self.chat_id else [])
+        if not targets:
             log.warning("no TELEGRAM_CHAT_ID yet; send /start to the bot")
             return False
-        res = self._call("sendMessage", chat_id=target, text=html,
-                         parse_mode="HTML", disable_web_page_preview="true",
-                         reply_markup=json.dumps(markup) if markup else None)
-        return bool(res and res.get("ok"))
+        delivered = 0
+        for target in targets:
+            res = self._call("sendMessage", chat_id=target, text=html,
+                             parse_mode="HTML",
+                             disable_web_page_preview="true",
+                             reply_markup=json.dumps(markup) if markup else None)
+            if res and res.get("ok"):
+                delivered += 1
+            else:
+                # Blocked the bot, deleted the chat, whatever: say which one,
+                # and carry on to the others.
+                log.warning("telegram: chat %s did not take the message",
+                            target)
+        return delivered > 0
 
     def set_commands(self, commands):
         """Fill the bot's menu in Telegram, so the commands are discoverable."""
@@ -860,6 +877,8 @@ def check_once(cfg, notifiers, notify=True, with_pickup=True):
     state = load_state(cfg.state_file)
     previous = state.get("parts", {})
     paused = bool(state.get("paused"))
+    if tg:
+        tg.recipients = recipient_ids(state, tg.chat_id)
 
     if with_pickup:
         pickup = fetch_pickup(cfg.parts, cfg.city)
@@ -988,6 +1007,15 @@ def authorize(state, owner, chat_id, username):
     return False, False
 
 
+def recipient_ids(state, owner):
+    """Everyone a finding should reach: the owner first, then the admins."""
+    out = [str(owner)] if owner else []
+    for cid in sorted((state.get("admins") or {}).keys()):
+        if cid not in out:
+            out.append(cid)
+    return out
+
+
 def render_admins(state, owner, html=True):
     """Answer for /admins: who may command the bot, and who is still awaited."""
     lines = ["<b>Кто управляет ботом</b>" if html else "Кто управляет ботом"]
@@ -1005,6 +1033,9 @@ def render_admins(state, owner, html=True):
     if len(lines) == 2:
         lines.append("Больше никого. /addadmin @имя — впустить.")
     lines.append("")
+    lines.append(f"Уведомления о находках приходят всем из этого списка "
+                 f"({len(recipient_ids(state, owner))} чат(а)); тем, кто ждёт "
+                 f"первого сообщения, — пока нет.")
     lines.append("Добавлять и убирать может только тот, кто уже в этом списке.")
     return "\n".join(lines)
 
@@ -1210,13 +1241,15 @@ def dispatch(rt, tg, state, cmd, text, chat_id, username):
             else:
                 answer = remove_admin(state, owner, parts[1])
             save_state(cfg.state_file, state)
-            log.info("/%s %s by %s -> %s", cmd, parts[1], by, answer)
+            tg.recipients = recipient_ids(state, owner)
+            log.info("/%s %s by %s -> %s (now %d recipient(s))", cmd,
+                     parts[1], by, answer, len(tg.recipients))
             reply(answer)
             # The owner is told whenever the guest list changes, even when
             # somebody else changed it: this is the one thing that decides
             # who can silence their alerts.
             if str(chat_id) != str(owner):
-                tg.send(f"ℹ️ {by} изменил список доступа: {answer}")
+                tg.send(f"ℹ️ {by} изменил список доступа: {answer}", to=owner)
     elif cmd == "help":
         reply(render_help())
 
@@ -1246,10 +1279,14 @@ def serve(cfg, notifiers, wd, hc, logs):
     seed_state = load_state(cfg.state_file)
     if seed_admins(cfg, seed_state):
         save_state(cfg.state_file, seed_state)
+    if tg:
+        tg.recipients = recipient_ids(seed_state, tg.chat_id)
     extra = len(seed_state.get("admins") or {}) + len(
         seed_state.get("admin_usernames") or [])
     if extra:
-        log.info("%d admin(s) besides the owner may command the bot", extra)
+        log.info("%d admin(s) besides the owner may command the bot; "
+                 "findings go to %d chat(s)", extra,
+                 len(tg.recipients) if tg else 0)
     if load_state(cfg.state_file).get("paused"):
         log.warning("notifications are paused (/resume to turn them back on); "
                     "findings are still recorded")
