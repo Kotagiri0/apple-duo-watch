@@ -30,8 +30,11 @@ Configuration comes from the environment (see .env.example):
   HEALTHCHECK_EVERY_SECONDS
                        at most one healthcheck ping per this many seconds
                        (default 60), so a 10s interval does not hammer it
+  HISTORY_FILE         where to keep the findings log that /alerts reads;
+                       defaults to the state file's name plus "-history"
 """
 import argparse
+import collections
 import datetime as dt
 import json
 import logging
@@ -69,6 +72,14 @@ MONTHS = {m: i for i, m in enumerate(
      "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"], start=1)}
 
 TELEGRAM_API = "https://api.telegram.org/bot{token}/{method}"
+
+# Telegram rejects anything longer, so /log and /alerts clip to fit.
+TELEGRAM_LIMIT = 4096
+# Findings kept in the state file, and log lines kept in memory. Both are
+# ring buffers: the file must not grow without bound and neither must the
+# resident size of a process meant to run for weeks.
+HISTORY_LIMIT = 200
+LOG_RING = 300
 
 log = logging.getLogger("duo")
 
@@ -113,6 +124,29 @@ def esc(text):
     we quote back are full of them ("<urlopen error [Errno -3] ...>")."""
     return (str(text).replace("&", "&amp;")
             .replace("<", "&lt;").replace(">", "&gt;"))
+
+
+class RingLog(logging.Handler):
+    """Keep the last few hundred log lines in memory, for /log.
+
+    A container cannot read its own docker log, and the alternative — mounting
+    the host log or shelling out to the daemon — would hand the watcher far
+    more than it needs just to quote itself. A deque costs a few kilobytes.
+    """
+
+    def __init__(self, capacity=LOG_RING):
+        super().__init__()
+        self.lines = collections.deque(maxlen=capacity)
+
+    def emit(self, record):
+        try:
+            self.lines.append((record.levelno, self.format(record)))
+        except Exception:                       # logging must never raise
+            self.handleError(record)
+
+    def tail(self, count, min_level=0):
+        picked = [text for level, text in self.lines if level >= min_level]
+        return picked[-count:]
 
 
 # ---------------------------------------------------------------- Apple store
@@ -265,14 +299,41 @@ def load_state(path):
         return {}
 
 
-def save_state(path, state):
+def save_json(path, data):
     parent = os.path.dirname(os.path.abspath(path))
     if parent:
         os.makedirs(parent, exist_ok=True)
     tmp = f"{path}.tmp"
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=1, sort_keys=True)
+        json.dump(data, f, indent=1, sort_keys=True)
     os.replace(tmp, path)
+
+
+def save_state(path, state):
+    save_json(path, state)
+
+
+def load_history(path):
+    """The findings log. Its own file, see append_history."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return []
+    return data if isinstance(data, list) else []
+
+
+def append_history(path, entries):
+    """Add findings to the history, keeping only the last HISTORY_LIMIT.
+
+    Kept apart from the state file on purpose: that one is rewritten every
+    cycle, and carrying a few hundred records through every write would
+    multiply this service's disk traffic — on the deployed NanoPi, SD-card
+    wear — for data that changes a handful of times a day.
+    """
+    history = (load_history(path) + entries)[-HISTORY_LIMIT:]
+    save_json(path, history)
+    return history
 
 
 # ----------------------------------------------------------------- telegram
@@ -329,12 +390,19 @@ class Telegram:
     def fail_streak(self):
         return self._fail_streak
 
-    def send(self, html, text=None):
+    def send(self, html, text=None, markup=None):
         if not self.chat_id:
             log.warning("no TELEGRAM_CHAT_ID yet; send /start to the bot")
             return False
         res = self._call("sendMessage", chat_id=self.chat_id, text=html,
-                         parse_mode="HTML", disable_web_page_preview="true")
+                         parse_mode="HTML", disable_web_page_preview="true",
+                         reply_markup=json.dumps(markup) if markup else None)
+        return bool(res and res.get("ok"))
+
+    def set_commands(self, commands):
+        """Fill the bot's menu in Telegram, so the commands are discoverable."""
+        res = self._call("setMyCommands", commands=json.dumps(
+            [{"command": c, "description": d} for c, d in commands]))
         return bool(res and res.get("ok"))
 
     def poll_commands(self, timeout=0):
@@ -365,7 +433,7 @@ class Ntfy:
     def enabled(self):
         return bool(self.url)
 
-    def send(self, html, text=None):
+    def send(self, html, text=None, markup=None):
         if not self.url:
             return False
         body = (text if text is not None else html).encode("utf-8")
@@ -373,6 +441,12 @@ class Ntfy:
         # body carries the UTF-8 text.
         headers = {"Title": "iPhone Duo - Apple UAE",
                    "Content-Type": "text/plain; charset=utf-8"}
+        # The same link the Telegram button carries, as the notification's tap
+        # target. ntfy has no inline keyboard, but it does have this.
+        first_url = next((b["url"] for row in (markup or {}).get(
+            "inline_keyboard", []) for b in row if b.get("url")), None)
+        if first_url:
+            headers["Click"] = first_url
         if self.token:
             headers["Authorization"] = f"Bearer {self.token}"
         try:
@@ -441,11 +515,11 @@ class Healthcheck:
         return ok
 
 
-def announce(notifiers, html, text):
+def announce(notifiers, html, text, markup=None):
     """Fan an alert out to every configured channel. Returns how many took it."""
     sent = 0
     for n in notifiers:
-        if n.enabled and n.send(html, text):
+        if n.enabled and n.send(html, text, markup):
             sent += 1
     return sent
 
@@ -556,7 +630,22 @@ class Watchdog:
         return alert
 
 
-def render_health(cfg, tg, hc, html=True):
+def status_footer(rt, state, html=True):
+    """The two lines of health that belong next to the prices, and no more."""
+    earliest = min((p["date"] for p in rt.current.values() if p.get("date")),
+                   default=None)
+    lines = []
+    if earliest:
+        lines.append(f"Самый ранний срок: {earliest}")
+    lines.append(f"Последний удачный опрос: {ago(state.get('checked_at'))}")
+    if state.get("paused"):
+        queued = len(state.get("paused_queue") or [])
+        lines.append(f"⏸ Уведомления на паузе, накопилось {queued}. "
+                     f"/resume — включить")
+    return "\n".join(lines)
+
+
+def render_health(cfg, tg, hc, rt=None, html=True):
     """Answer for /health: when the store was last seen, and by which path."""
     state = load_state(cfg.state_file)
     health = state.get("health") or {}
@@ -594,12 +683,26 @@ def render_health(cfg, tg, hc, html=True):
     else:
         lines.append("➖ Внешнего healthcheck нет (HEALTHCHECK_URL пуст): "
                      "если процесс умрёт целиком, сказать об этом будет некому")
+
+    pickup_note = ("" if cfg.pickup_every == 1
+                   else f", самовывоз раз в {cfg.pickup_every} циклов")
+    lines.append(f"🔁 Интервал: {cfg.interval} с{pickup_note}")
+    if rt is not None:
+        lines.append(f"♻️ Циклов с запуска: {rt.cycles} "
+                     f"(запущен {ago(rt.started)})")
+    history = load_history(cfg.history_file)
+    lines.append(f"🗂 Находок в истории: {len(history)}"
+                 + (f", последняя {ago(history[-1].get('at'))}"
+                    if history else ""))
+    if state.get("paused"):
+        queued = len(state.get("paused_queue") or [])
+        lines.append(f"⏸ Уведомления на паузе, накопилось {queued}")
     return "\n".join(lines)
 
 
 # ------------------------------------------------------------------ service
 
-def render_status(current, parts, pickup, checked_at, html=True):
+def render_status(current, parts, pickup, checked_at, html=True, footer=None):
     if html:
         lines = [f"<b>iPhone Duo — Apple UAE</b>  <i>{checked_at}</i>"]
     else:
@@ -618,6 +721,9 @@ def render_status(current, parts, pickup, checked_at, html=True):
         else:
             lines.append(f'{mark} {name} — {cur["label"]}, {price} AED{tail}'
                          f'\n   {link_for(pn)}')
+    if footer:
+        lines.append("")
+        lines.append(footer)
     return "\n".join(lines)
 
 
@@ -640,6 +746,85 @@ def render_alert(events, html=True):
             + "\n\nОформление и оплату подтверждаешь сам.")
 
 
+def alert_markup(events):
+    """One link button per finding — plain Bot API, nothing to install."""
+    rows, seen = [], set()
+    for _kind, pn, name, _price, _detail, link in events:
+        if pn in seen:
+            continue
+        seen.add(pn)
+        rows.append([{"text": f"Открыть {name}", "url": link}])
+    return {"inline_keyboard": rows[:8]} if rows else None
+
+
+def history_entries(events, previous, current, at):
+    """Findings as records for the state file, so /alerts can look back."""
+    out = []
+    for kind, pn, name, price, detail, _link in events:
+        old = previous.get(pn) or {}
+        cur = current.get(pn) or {}
+        out.append({"at": at, "kind": kind, "part": pn, "name": name,
+                    "price": price, "detail": detail,
+                    "old_date": old.get("date"), "new_date": cur.get("date"),
+                    "old_label": old.get("label"), "new_label": cur.get("label")})
+    return out
+
+
+def clip_tail(text, budget):
+    """Keep the end: in a log and in a history, the tail is the news."""
+    if len(text) <= budget:
+        return text, False
+    return text[-budget:], True
+
+
+def render_alerts(history, count, html=True, title=None):
+    """Answer for /alerts: the findings that were made, newest first."""
+    if not history:
+        return ("Находок ещё не было ни одной. Сервис сообщает только об "
+                "изменениях, так что само по себе это не поломка: значит, с "
+                "запуска ничего не менялось.")
+    shown = history[-count:]
+    head = title or f"Последние находки — {len(shown)} из {len(history)}"
+    lines = [f"<b>{head}</b>" if html else head]
+    for e in reversed(shown):
+        icon = ALERT_ICONS.get(e.get("kind"), "•")
+        when = (e.get("at") or "")[:16].replace("T", " ")
+        name = e.get("name") or e.get("part") or "?"
+        move = ""
+        if e.get("old_date") or e.get("new_date"):
+            move = f"  {e.get('old_date') or '—'} → {e.get('new_date') or '—'}"
+        detail = e.get("detail") or ""
+        price = f", {e['price']} AED" if e.get("price") else ""
+        if html:
+            link = link_for(e["part"]) if e.get("part") else None
+            shown_name = (f'<a href="{link}">{esc(name)}</a>' if link
+                          else esc(name))
+            lines.append(f"{icon} <i>{when}</i> {shown_name}{esc(price)}"
+                         f"{esc(move)}\n    {esc(detail)}")
+        else:
+            lines.append(f"{icon} {when} {name}{price}{move}\n    {detail}")
+    body = "\n".join(lines)
+    body, cut = clip_tail(body, TELEGRAM_LIMIT - 80)
+    return ("…\n" + body) if cut else body
+
+
+def render_log(logs, count, errors_only, html=True):
+    """Answer for /log: the tail of this process's own log."""
+    lines = logs.tail(count, logging.WARNING if errors_only else 0)
+    if not lines:
+        return ("Ни одной строки WARNING и выше — пока всё спокойно."
+                if errors_only else "Лог пока пуст.")
+    head = (f"Лог, последние {len(lines)} стр."
+            + (" (WARNING и выше)" if errors_only else ""))
+    body = esc("\n".join(lines)) if html else "\n".join(lines)
+    # The head, the <pre> wrapper and the "tail only" note all have to fit.
+    body, cut = clip_tail(body, TELEGRAM_LIMIT - len(head) - 120)
+    note = "\n(показан только хвост — целиком не влезает)" if cut else ""
+    if html:
+        return f"<b>{head}</b>{note}\n<pre>{body}</pre>"
+    return f"{head}{note}\n{body}"
+
+
 def check_once(cfg, notifiers, notify=True, with_pickup=True):
     """One pass. Returns (events, current, pickup). Raises AppleUnreachable."""
     tg = next((n for n in notifiers if isinstance(n, Telegram)), None)
@@ -648,6 +833,7 @@ def check_once(cfg, notifiers, notify=True, with_pickup=True):
 
     state = load_state(cfg.state_file)
     previous = state.get("parts", {})
+    paused = bool(state.get("paused"))
 
     if with_pickup:
         pickup = fetch_pickup(cfg.parts, cfg.city)
@@ -673,7 +859,7 @@ def check_once(cfg, notifiers, notify=True, with_pickup=True):
         log.info("baseline recorded for %d SKUs, earliest ship date %s",
                  len(current), best)
         persist()
-        if notify:
+        if notify and not paused:
             tail = (f"\n\nПроверка каждые {cfg.interval} с. "
                     "Напишу, как только отправка станет раньше.")
             announce(
@@ -688,27 +874,110 @@ def check_once(cfg, notifiers, notify=True, with_pickup=True):
     for ev in events:
         log.info("%s", format_event(ev))
 
-    if events and notify:
-        delivered = announce(notifiers, render_alert(events),
-                             render_alert(events, html=False))
-        if not delivered:
-            # Persisting now would make this change "already seen" and it would
-            # never be reported again, so the old state stays and the next
-            # check rediscovers it.
-            log.warning("found %d change(s) but no channel accepted them; "
-                        "keeping the previous state so the next check retries",
-                        len(events))
-            # The new dates stay unrecorded, but the fact that Apple answered
-            # is saved: checked_at is what says the watcher is not blind.
-            save_state(cfg.state_file, state)
+    if events:
+        entries = history_entries(events, previous, current, checked_at)
+        if notify and paused:
+            # Paused means "say nothing", not "notice nothing". The findings
+            # are kept twice — in the history and in the queue /resume reports
+            # — and the state does move on. Holding it back instead would
+            # rediscover the same change every cycle and fill the history with
+            # copies of it; nothing is lost, because /resume replays the queue.
+            append_history(cfg.history_file, entries)
+            state["paused_queue"] = (
+                (state.get("paused_queue") or []) + entries)[-HISTORY_LIMIT:]
+            log.info("paused: %d finding(s) recorded but not sent", len(events))
+            persist()
             return events, current, pickup
+        if notify:
+            delivered = announce(notifiers, render_alert(events),
+                                 render_alert(events, html=False),
+                                 alert_markup(events))
+            if not delivered:
+                # Persisting now would make this change "already seen" and it
+                # would never be reported again, so the old state stays and
+                # the next check rediscovers it.
+                log.warning("found %d change(s) but no channel accepted them; "
+                            "keeping the previous state so the next check "
+                            "retries", len(events))
+                # The new dates stay unrecorded, but the fact that Apple
+                # answered is saved: checked_at is what says we are not blind.
+                save_state(cfg.state_file, state)
+                return events, current, pickup
+        append_history(cfg.history_file, entries)
 
     persist()
     return events, current, pickup
 
 
-def handle_commands(cfg, tg, last, hc=None):
-    """Answer /start, /status, /health, /help. Adopts the first chat if none."""
+class Runtime:
+    """What the command handlers need to know about the running service."""
+
+    def __init__(self, cfg, notifiers, hc, logs):
+        self.cfg = cfg
+        self.notifiers = notifiers
+        self.hc = hc
+        self.logs = logs
+        self.current = {}
+        self.pickup = {}
+        self.checked_at = ""
+        self.cycles = 0
+        self.started = now_iso()
+
+
+COMMANDS = [
+    ("status", "даты отправки по всем конфигурациям"),
+    ("alerts", "последние находки, например /alerts 25"),
+    ("check", "проверить прямо сейчас, не дожидаясь интервала"),
+    ("health", "самочувствие наблюдателя"),
+    ("log", "хвост лога, например /log 50 или /log errors"),
+    ("pause", "замолчать, не прекращая следить"),
+    ("resume", "снова присылать уведомления"),
+    ("help", "что умеет бот"),
+]
+
+
+def parse_count(text, default, cap):
+    """'/alerts 25' -> 25, clamped. Anything else keeps the default."""
+    for word in text.split()[1:]:
+        if word.isdigit():
+            return max(1, min(int(word), cap))
+    return default
+
+
+def render_help(html=True):
+    lines = ["<b>Что умеет бот</b>" if html else "Что умеет бот"]
+    lines += [f"/{cmd} — {about}" for cmd, about in COMMANDS]
+    lines.append("")
+    lines.append("Сам я ничего не покупаю: присылаю ссылку на нужную "
+                 "конфигурацию, оформление и оплату подтверждаешь ты.")
+    return "\n".join(lines)
+
+
+def run_check_now(rt, tg):
+    """/check: a pass right now, instead of waiting out the interval."""
+    try:
+        events, current, pickup = check_once(rt.cfg, rt.notifiers)
+    except AppleUnreachable as e:
+        tg.send(f"Apple не ответил: {esc(e)}")
+        return
+    rt.current, rt.pickup, rt.checked_at = current, pickup, now_iso()
+    rt.cycles += 1
+    state = load_state(rt.cfg.state_file)
+    if not events:
+        tg.send("Изменений нет.\n" + render_status(
+            current, rt.cfg.parts, pickup, rt.checked_at,
+            footer=status_footer(rt, state)))
+    elif state.get("paused"):
+        tg.send(f"Нашёл изменений: {len(events)}. Уведомления на паузе, "
+                f"так что записал в историю — /resume покажет.")
+    else:
+        tg.send(f"Нашёл изменений: {len(events)} — прислал отдельным "
+                f"сообщением.")
+
+
+def handle_commands(rt, tg):
+    """Answer the owner's commands; everyone else gets silence."""
+    cfg = rt.cfg
     for chat_id, text in tg.poll_commands():
         cmd = text.split()[0].lower().lstrip("/").split("@")[0]
         if tg.chat_id is None:
@@ -718,26 +987,54 @@ def handle_commands(cfg, tg, last, hc=None):
             save_state(cfg.state_file, state)
             log.info("adopted chat_id %s", chat_id)
         if chat_id != tg.chat_id:
+            # Only the owner's chat is answered, and a stranger is told
+            # nothing at all — not even that the command exists.
+            log.warning("ignoring /%s from chat %s", cmd, chat_id)
             continue
+        state = load_state(cfg.state_file)
+
         if cmd in ("start", "status"):
-            current, pickup, checked_at = last
-            if current:
-                tg.send(render_status(current, cfg.parts, pickup, checked_at))
+            if rt.current:
+                tg.send(render_status(rt.current, cfg.parts, rt.pickup,
+                                      rt.checked_at,
+                                      footer=status_footer(rt, state)))
             else:
                 tg.send("Ещё не делал первую проверку, подожди минуту.")
+        elif cmd == "alerts":
+            tg.send(render_alerts(load_history(cfg.history_file),
+                                  parse_count(text, 10, 50)))
         elif cmd == "health":
-            tg.send(render_health(cfg, tg, hc))
+            tg.send(render_health(cfg, tg, rt.hc, rt))
+        elif cmd == "log":
+            tg.send(render_log(rt.logs, parse_count(text, 20, 100),
+                               "errors" in text.lower()))
+        elif cmd == "check":
+            run_check_now(rt, tg)
+        elif cmd == "pause":
+            state["paused"] = True
+            save_state(cfg.state_file, state)
+            tg.send("⏸ Уведомления выключены. Следить продолжаю: находки "
+                    "пишу в историю и в лог, /resume вернёт их и снова "
+                    "включит сообщения.")
+        elif cmd == "resume":
+            queued = state.get("paused_queue") or []
+            state["paused"] = False
+            state["paused_queue"] = []
+            save_state(cfg.state_file, state)
+            if queued:
+                tg.send(render_alerts(
+                    queued, len(queued),
+                    title=f"▶️ Снова на связи. За паузу накопилось находок: "
+                          f"{len(queued)}"))
+            else:
+                tg.send("▶️ Снова на связи. За паузу ничего не нашлось.")
         elif cmd == "help":
-            tg.send("/status — текущие даты отправки по всем конфигурациям\n"
-                    "/health — когда был последний удачный опрос, сколько "
-                    "неудач подряд, жив ли туннель\n"
-                    "/help — это сообщение\n\n"
-                    "Сам я ничего не покупаю: присылаю ссылку, "
-                    "оплату подтверждаешь ты.")
+            tg.send(render_help())
 
 
-def serve(cfg, notifiers, wd, hc):
+def serve(cfg, notifiers, wd, hc, logs):
     tg = next((n for n in notifiers if isinstance(n, Telegram)), None)
+    rt = Runtime(cfg, notifiers, hc, logs)
     stop = {"now": False}
 
     def _stop(signum, _frame):
@@ -757,8 +1054,14 @@ def serve(cfg, notifiers, wd, hc):
     log.info("watchdog: alerting after %ds of unbroken failure; heartbeat=%s",
              cfg.blind_after,
              f"{hc.host} every {hc.every}s" if hc.enabled else "off")
+    if load_state(cfg.state_file).get("paused"):
+        log.warning("notifications are paused (/resume to turn them back on); "
+                    "findings are still recorded")
+    if tg and tg.enabled:
+        # Puts the commands in Telegram's own menu, so they are discoverable
+        # without reading the README.
+        tg.set_commands(COMMANDS)
 
-    last = ({}, {}, "")
     backoff = 0
     cycle = 0
     while not stop["now"]:
@@ -767,7 +1070,8 @@ def serve(cfg, notifiers, wd, hc):
             events, current, pickup = check_once(
                 cfg, notifiers, with_pickup=(cycle % cfg.pickup_every == 0))
             cycle += 1
-            last = (current, pickup, now_iso())
+            rt.current, rt.pickup, rt.checked_at = current, pickup, now_iso()
+            rt.cycles = cycle
             backoff = 0
             earliest = min((p["date"] for p in current.values()
                             if p.get("date")), default=None)
@@ -789,7 +1093,7 @@ def serve(cfg, notifiers, wd, hc):
 
         if tg and tg.enabled:
             try:
-                handle_commands(cfg, tg, last, hc)
+                handle_commands(rt, tg)
             except Exception:
                 log.exception("command handling failed")
             # getUpdates ran just now, so its outcome is a live check of the
@@ -819,6 +1123,8 @@ class Config:
                      else os.environ.get("CITY", "Dubai"))
         self.state_file = (args.state or os.environ.get("STATE_FILE")
                            or os.path.expanduser("~/.apple-duo-watch/state.json"))
+        self.history_file = (os.environ.get("HISTORY_FILE")
+                             or f"{os.path.splitext(self.state_file)[0]}-history.json")
         before = args.alert_before or os.environ.get("ALERT_BEFORE") or ""
         self.threshold = dt.date.fromisoformat(before) if before else None
         only = (args.only or os.environ.get("ONLY_PARTS") or "").strip()
@@ -866,10 +1172,14 @@ def main(argv=None):
                     help="warn after this long without a successful check")
     args = ap.parse_args(argv)
 
-    logging.basicConfig(
-        level=logging.INFO, stream=sys.stdout,
-        format="%(asctime)s %(levelname)s %(message)s",
-        datefmt="%Y-%m-%dT%H:%M:%S%z")
+    fmt = "%(asctime)s %(levelname)s %(message)s"
+    datefmt = "%Y-%m-%dT%H:%M:%S%z"
+    logging.basicConfig(level=logging.INFO, stream=sys.stdout,
+                        format=fmt, datefmt=datefmt)
+    # Attached before anything else runs, so the startup warnings are in /log.
+    logs = RingLog()
+    logs.setFormatter(logging.Formatter(fmt, datefmt=datefmt))
+    logging.getLogger().addHandler(logs)
 
     cfg = Config(args)
     state = load_state(cfg.state_file)
@@ -913,7 +1223,7 @@ def main(argv=None):
             log.info("no change")
         return 0
 
-    serve(cfg, notifiers, wd, hc)
+    serve(cfg, notifiers, wd, hc, logs)
     return 0
 
 
