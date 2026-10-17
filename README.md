@@ -52,6 +52,75 @@ Commands: `/status` (current ship dates for every configuration), `/help`.
 The token is a credential: it lives in `.env`, which is gitignored. Do not
 commit it, and rotate it via `/revoke` in BotFather if it leaks.
 
+## Deployment layout
+
+Two machines. The watcher runs at home, where Telegram is blocked, so the Bot
+API calls are tunnelled through a VPS that can reach it. Apple is always
+fetched directly from the watcher — only Telegram takes the detour.
+
+```
+  MacBook (dev)                     watcher host                    proxy host
+  ~/pupazalupa                      NanoPi R4S                      VPS
+                                    37.204.22.209                   188.213.0.80
+  ┌──────────────┐                 ┌─────────────────────┐        ┌──────────────────┐
+  │ git, deploy  │   ssh :2222     │ docker              │        │ tinyproxy        │
+  │ script, .env │ ──────────────▶ │  apple-duo-watch    │        │ 127.0.0.1:8888   │
+  └──────────────┘   duo_deploy    │                     │        └────────▲─────────┘
+                                   │ telegram-tunnel     │  ssh :22        │
+                                   │  172.17.0.1:8888 ───┼────────────────▶┘
+                                   └──────┬──────────────┘  tunnel_to_vps
+                                          │
+                        apple.com/ae ◀────┤ direct, no proxy
+                        ntfy.sh     ◀─────┘ direct, fallback channel
+```
+
+### Watcher host — NanoPi R4S
+
+| | |
+|---|---|
+| Hostname | `nanopi-r4s` |
+| OS | Armbian 26.8.1 (Ubuntu 26.04 "resolute"), aarch64 |
+| Resources | 3.8 GB RAM, 55 GB free of 57 GB |
+| Network | `37.204.22.209`, LAN `192.168.0.111` behind `192.168.0.1` on `end0` |
+| SSH | port **2222**, `root`, key `~/.ssh/duo_deploy` |
+| Docker | `docker.io` 29.1.3, `docker-compose-v2` 2.40.3, both enabled at boot |
+| Service | container `apple-duo-watch`, `restart: unless-stopped` |
+| State | volume `apple-duo-watch_duo-state` mounted at `/data/state.json` |
+| Tunnel | `telegram-tunnel.service`, enabled, key `/root/.ssh/tunnel_to_vps` |
+| Files | `/opt/apple-duo-watch/` — `watcher.py`, `Dockerfile`, `docker-compose.yml`, `.env` |
+
+Docker came from the Ubuntu archive rather than `get.docker.com`: that script
+aborts here because the Armbian mirror (`apt.armbian.com`) times out, which
+makes its `apt-get update` fail.
+
+### Proxy host — VPS
+
+| | |
+|---|---|
+| Hostname | `qwertjklk.com` |
+| OS | Ubuntu 24.04 LTS, x86_64 |
+| Resources | 14.7 GB disk |
+| Network | `188.213.0.80` |
+| SSH | port **22**, `root`, key `~/.ssh/duo_tunnel` |
+| Service | `tinyproxy` on `127.0.0.1:8888`, enabled, loopback only |
+| Purpose | reaches `api.telegram.org`, which the watcher host cannot |
+
+Its `authorized_keys` holds three entries: the admin key from the MacBook, the
+MacBook's own default key, and the watcher's key restricted to the single
+forward it needs.
+
+Nothing on this host listens publicly except SSH — tinyproxy is bound to
+loopback, so the proxy is reachable only from inside the tunnel.
+
+### Keys
+
+| Key | From | To | Scope |
+|---|---|---|---|
+| `~/.ssh/duo_deploy` | MacBook | NanoPi :2222 | full root, deploys |
+| `~/.ssh/duo_tunnel` | MacBook | VPS :22 | full root, admin |
+| `~/.ssh/id_ed25519` | MacBook | VPS :22 | full root, your own login |
+| `/root/.ssh/tunnel_to_vps` | NanoPi | VPS :22 | `permitopen` 127.0.0.1:8888, no shell |
+
 ## Run it
 
 ### Docker (recommended on a server)
@@ -117,9 +186,10 @@ python3 -I watcher.py --once     # one pass, report changes, exit
 ## Configuration
 
 Every setting is an environment variable, documented in `.env.example`:
-`TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `INTERVAL_SECONDS`, `CITY`,
-`ALERT_BEFORE`, `ONLY_PARTS`, `STATE_FILE`. CLI flags of the same name win over
-the environment.
+`TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `TELEGRAM_PROXY`, `NTFY_URL`,
+`NTFY_TOKEN`, `INTERVAL_SECONDS`, `PICKUP_EVERY`, `CITY`, `ALERT_BEFORE`,
+`ONLY_PARTS`, `STATE_FILE`. CLI flags of the same name win over the
+environment.
 
 ## When Telegram is blocked on the watcher's network
 
@@ -149,14 +219,26 @@ sooner.
 
 ## Polling rate
 
-`INTERVAL_SECONDS=60` is the intended cadence. Two things to know:
+The deployment runs at `INTERVAL_SECONDS=10`. That is deliberately aggressive,
+and the trade-off is worth stating plainly: a freed pre-order slot can be gone
+within a minute, so a short interval is the point — but Apple rate-limits by
+source IP, and a block makes the watcher blind, which is strictly worse than a
+slower poll. Four things keep that risk down:
 
-- Apple rate-limits aggressive clients; one of its availability endpoints
-  already answers `541` to plain scripted requests. Each tick adds up to 15%
-  random jitter so the traffic does not look like a metronome, and failures back
-  off exponentially up to 15 minutes rather than hammering through a block.
-- Going below ~30 seconds raises the risk of the source IP being blocked, which
-  makes the watcher blind. The service warns at startup if you do it anyway.
+- Each cycle subtracts its own request time from the wait, so the period is the
+  interval itself rather than the interval plus however long Apple took.
+- Up to 15% random jitter per tick, so the traffic does not look like a
+  metronome.
+- The in-store pickup lookup is a second request, so it runs every Nth cycle —
+  about once a minute at any interval, via `PICKUP_EVERY`. At 10 seconds that
+  is one request per cycle instead of two.
+- Failures back off exponentially to 15 minutes instead of hammering through a
+  block, and the service warns at startup whenever the interval is under 30
+  seconds.
+
+One of Apple's availability endpoints already answers `541` to plain scripted
+requests, so the limits are real rather than theoretical. If the logs start
+showing `apple unreachable` in runs, raise the interval.
 
 ## Scope
 

@@ -18,6 +18,9 @@ Configuration comes from the environment (see .env.example):
   ALERT_BEFORE         YYYY-MM-DD; always alert while any SKU ships on or before it
   STATE_FILE           where to keep the last seen state
   ONLY_PARTS           comma-separated part numbers to narrow the watch
+  PICKUP_EVERY         check in-store pickup every Nth cycle instead of all of
+                       them; defaults to roughly once a minute, which keeps a
+                       short INTERVAL_SECONDS from doubling the request rate
 """
 import argparse
 import datetime as dt
@@ -376,15 +379,22 @@ def render_alert(events, html=True):
             + "\n\nОформление и оплату подтверждаешь сам.")
 
 
-def check_once(cfg, notifiers, notify=True):
+def check_once(cfg, notifiers, notify=True, with_pickup=True):
     """One pass. Returns (events, current, pickup). Raises AppleUnreachable."""
     tg = next((n for n in notifiers if isinstance(n, Telegram)), None)
     today = dt.date.today()
     current = fetch_delivery(cfg.parts, today)
-    pickup = fetch_pickup(cfg.parts, cfg.city)
 
     state = load_state(cfg.state_file)
     previous = state.get("parts", {})
+
+    if with_pickup:
+        pickup = fetch_pickup(cfg.parts, cfg.city)
+    else:
+        # Carry the last known pickup forward, so skipping the lookup cannot
+        # read as "pickup disappeared".
+        pickup = {pn: list(p.get("pickup") or [])
+                  for pn, p in previous.items() if p.get("pickup")}
     events = diff(previous, current, pickup, cfg.parts, cfg.threshold)
 
     checked_at = dt.datetime.now().astimezone().isoformat(timespec="seconds")
@@ -472,14 +482,20 @@ def serve(cfg, notifiers):
     channels = ", ".join(
         f"{type(n).__name__.lower()}{'+proxy' if getattr(n, 'proxy', None) else ''}"
         for n in notifiers if n.enabled) or "none (stdout only)"
-    log.info("watching %d SKUs every %ds (city=%s, channels=%s)",
-             len(cfg.parts), cfg.interval, cfg.city or "off", channels)
+    pickup_note = (cfg.city if not cfg.city or cfg.pickup_every == 1
+                   else f"{cfg.city} every {cfg.pickup_every} cycles")
+    log.info("watching %d SKUs every %ds (pickup=%s, channels=%s)",
+             len(cfg.parts), cfg.interval, pickup_note or "off", channels)
 
     last = ({}, {}, "")
     backoff = 0
+    cycle = 0
     while not stop["now"]:
+        started = time.monotonic()
         try:
-            events, current, pickup = check_once(cfg, notifiers)
+            events, current, pickup = check_once(
+                cfg, notifiers, with_pickup=(cycle % cfg.pickup_every == 0))
+            cycle += 1
             last = (current, pickup,
                     dt.datetime.now().astimezone().isoformat(timespec="seconds"))
             backoff = 0
@@ -501,8 +517,12 @@ def serve(cfg, notifiers):
             except Exception:
                 log.exception("command handling failed")
 
+        # Subtract the work already done, so the cycle period is the interval
+        # rather than interval plus however long Apple took to answer.
+        elapsed = time.monotonic() - started
+        base = backoff or max(0.0, cfg.interval - elapsed)
         # Jitter keeps a fixed interval from looking like a metronome to Apple.
-        wait = (backoff or cfg.interval) + random.uniform(0, cfg.interval * 0.15)
+        wait = base + random.uniform(0, cfg.interval * 0.15)
         deadline = time.monotonic() + wait
         while not stop["now"] and time.monotonic() < deadline:
             time.sleep(min(1.0, deadline - time.monotonic()))
@@ -529,9 +549,14 @@ class Config:
             self.parts = {k: v for k, v in ALL_PARTS.items() if k in wanted}
         else:
             self.parts = dict(ALL_PARTS)
+        # One delivery request per cycle is unavoidable; the pickup lookup is a
+        # second one, so at short intervals it runs about once a minute instead.
+        every = args.pickup_every or os.environ.get("PICKUP_EVERY")
+        self.pickup_every = max(1, int(every)) if every else max(
+            1, round(60 / self.interval))
         if self.interval < 30:
-            log.warning("interval %ds is aggressive; Apple may rate-limit this IP",
-                        self.interval)
+            log.warning("interval %ds is aggressive; Apple may rate-limit this "
+                        "IP, which would make the watcher blind", self.interval)
 
 
 def main(argv=None):
@@ -546,6 +571,8 @@ def main(argv=None):
     ap.add_argument("--alert-before", default=None, metavar="YYYY-MM-DD")
     ap.add_argument("--only", default=None,
                     help="comma-separated part numbers to watch")
+    ap.add_argument("--pickup-every", type=int, default=None, metavar="N",
+                    help="look up in-store pickup every Nth cycle")
     args = ap.parse_args(argv)
 
     logging.basicConfig(
