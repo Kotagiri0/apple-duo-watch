@@ -1,0 +1,10 @@
+[Unit]
+Description=Refresh the primary watcher's heartbeat every minute
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=60s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target
