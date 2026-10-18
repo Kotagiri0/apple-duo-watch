@@ -1,0 +1,9 @@
+[Unit]
+Description=Alert when apple-duo-watch stops sending heartbeats
+Documentation=https://github.com/Kotagiri0/apple-duo-watch
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/duo-deadman.sh

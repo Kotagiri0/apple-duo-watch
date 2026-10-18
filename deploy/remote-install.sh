@@ -29,13 +29,21 @@ SSH_OPTS=(-p "$PORT" -o ConnectTimeout=20)
 [[ -n $IDENTITY ]] && SSH_OPTS+=(-i "$IDENTITY" -o IdentitiesOnly=yes)
 ssh_run() { ssh "${SSH_OPTS[@]}" "$TARGET" "$@"; }
 
-if [[ ! -f "$HERE/.env" ]]; then
-  echo "error: $HERE/.env is missing — copy .env.example to .env and put the bot token in it" >&2
-  exit 1
-fi
-
 echo "==> connecting to $TARGET (port $PORT)"
 ssh_run 'echo "connected to $(hostname)"'
+
+# The token can live here or already on the server. Keeping a second copy of
+# it on your laptop is optional: an update does not need to resend the .env.
+SEND_ENV=1
+if [[ ! -f "$HERE/.env" ]]; then
+  if ssh_run "grep -qE '^TELEGRAM_BOT_TOKEN=.+' '$REMOTE_DIR/.env'" 2>/dev/null; then
+    echo "==> keeping the .env already in $TARGET:$REMOTE_DIR"
+    SEND_ENV=0
+  else
+    echo "error: $HERE/.env is missing — copy .env.example to .env and put the bot token in it" >&2
+    exit 1
+  fi
+fi
 
 echo "==> ensuring docker is present"
 ssh_run 'set -e
@@ -50,8 +58,11 @@ echo "==> copying service files to $REMOTE_DIR"
 ssh_run "mkdir -p '$REMOTE_DIR'"
 # No --chmod here: the rsync macOS ships with does not support it.
 rsync -az -e "ssh ${SSH_OPTS[*]}" \
-  "$HERE/watcher.py" "$HERE/Dockerfile" "$HERE/docker-compose.yml" "$HERE/.env" \
+  "$HERE/watcher.py" "$HERE/Dockerfile" "$HERE/docker-compose.yml" \
   "$TARGET:$REMOTE_DIR/"
+if (( SEND_ENV )); then
+  rsync -az -e "ssh ${SSH_OPTS[*]}" "$HERE/.env" "$TARGET:$REMOTE_DIR/"
+fi
 ssh_run "chmod 600 '$REMOTE_DIR/.env'"
 
 echo "==> building and starting"

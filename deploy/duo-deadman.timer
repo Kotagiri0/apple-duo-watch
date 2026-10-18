@@ -1,0 +1,13 @@
+[Unit]
+Description=Check every couple of minutes that apple-duo-watch is alive
+Documentation=https://github.com/Kotagiri0/apple-duo-watch
+
+[Timer]
+# Late enough after a reboot that the tunnel and the sink are up again, so a
+# restart of this machine does not look like a dead watcher.
+OnBootSec=4min
+OnUnitActiveSec=2min
+AccuracySec=15s
+
+[Install]
+WantedBy=timers.target

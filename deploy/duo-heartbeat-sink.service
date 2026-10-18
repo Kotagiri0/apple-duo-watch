@@ -1,0 +1,25 @@
+[Unit]
+Description=Heartbeat sink for apple-duo-watch (loopback only)
+Documentation=https://github.com/Kotagiri0/apple-duo-watch
+After=network.target
+
+[Service]
+Type=simple
+Environment=HEARTBEAT_FILE=/run/duo-watch/heartbeat
+Environment=LISTEN_PORT=8899
+ExecStart=/usr/bin/python3 -I /usr/local/lib/duo-heartbeat-sink.py
+Restart=always
+RestartSec=5
+# /run/duo-watch belongs to the dynamic user; duo-deadman.sh only reads the
+# mtime, which needs nothing more than the directory being world-readable.
+DynamicUser=yes
+RuntimeDirectory=duo-watch
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+NoNewPrivileges=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+
+[Install]
+WantedBy=multi-user.target
