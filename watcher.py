@@ -957,7 +957,7 @@ def check_once(cfg, notifiers, notify=True, with_pickup=True):
 # -------------------------------------------------------------------- access
 
 def norm_handle(name):
-    """'@DhXd263' -> 'dhxd263'. Telegram handles are case-insensitive."""
+    """'@Example_Handle' -> 'example_handle'. Handles are case-insensitive."""
     return (name or "").strip().lstrip("@").lower()
 
 
