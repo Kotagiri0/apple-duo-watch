@@ -76,6 +76,9 @@ MONTHS = {m: i for i, m in enumerate(
 
 TELEGRAM_API = "https://api.telegram.org/bot{token}/{method}"
 
+# Our urgency words onto ntfy's 1..5 scale. Telegram has only loud or silent.
+NTFY_PRIORITY = {"urgent": "5", "low": "2"}
+
 # Telegram rejects anything longer, so /log and /alerts clip to fit.
 TELEGRAM_LIMIT = 4096
 # Findings kept in the state file, and log lines kept in memory. Both are
@@ -415,7 +418,7 @@ class Telegram:
     def fail_streak(self):
         return self._fail_streak
 
-    def send(self, html, text=None, markup=None, to=None):
+    def send(self, html, text=None, markup=None, to=None, priority=None):
         """Send to `to`, or to every recipient when it is not given.
 
         A reply names its chat and goes only there; a finding names none and
@@ -435,6 +438,8 @@ class Telegram:
             res = self._call("sendMessage", chat_id=target, text=html,
                              parse_mode="HTML",
                              disable_web_page_preview="true",
+                             disable_notification=(
+                                 "true" if priority == "low" else None),
                              reply_markup=json.dumps(markup) if markup else None)
             if res and res.get("ok"):
                 delivered += 1
@@ -482,7 +487,7 @@ class Ntfy:
     def enabled(self):
         return bool(self.url)
 
-    def send(self, html, text=None, markup=None):
+    def send(self, html, text=None, markup=None, to=None, priority=None):
         if not self.url:
             return False
         body = (text if text is not None else html).encode("utf-8")
@@ -496,6 +501,13 @@ class Ntfy:
             "inline_keyboard", []) for b in row if b.get("url")), None)
         if first_url:
             headers["Click"] = first_url
+        # 5 is ntfy's max: on Android a long vibration burst and a pop-over.
+        # The phone can also be told to let this level through Do Not Disturb.
+        level = NTFY_PRIORITY.get(priority)
+        if level:
+            headers["Priority"] = level
+            if priority == "urgent":
+                headers["Tags"] = "rotating_light"
         if self.token:
             headers["Authorization"] = f"Bearer {self.token}"
         try:
@@ -564,11 +576,11 @@ class Healthcheck:
         return ok
 
 
-def announce(notifiers, html, text, markup=None):
+def announce(notifiers, html, text, markup=None, priority=None):
     """Fan an alert out to every configured channel. Returns how many took it."""
     sent = 0
     for n in notifiers:
-        if n.enabled and n.send(html, text, markup):
+        if n.enabled and n.send(html, text, markup, priority=priority):
             sent += 1
     return sent
 
@@ -657,7 +669,8 @@ class Watchdog:
             delivered = announce(
                 notifiers,
                 render_health_alert(kind, subject, entry, blind_for),
-                render_health_alert(kind, subject, entry, blind_for, html=False))
+                render_health_alert(kind, subject, entry, blind_for, html=False),
+                priority="urgent" if kind == "blind" else None)
             if delivered:
                 log.warning("watchdog: %s is %s, told %d channel(s)",
                             subject, kind, delivered)
@@ -779,6 +792,15 @@ def render_status(current, parts, pickup, checked_at, html=True, footer=None):
 ALERT_ICONS = {"EARLIER": "⏩", "BUYABLE": "🟢", "TARGET": "🎯",
                "PICKUP": "🏬", "CHANGED": "ℹ️"}
 
+# A freed slot lives minutes. A notification read twenty minutes later is
+# worth nothing, so these wake the phone up; a plain label change does not.
+URGENT_KINDS = {"EARLIER", "BUYABLE", "TARGET", "PICKUP"}
+
+
+def urgency(events):
+    """'urgent' if any finding is worth waking up for, else 'low'."""
+    return "urgent" if any(e[0] in URGENT_KINDS for e in events) else "low"
+
 
 def render_alert(events, html=True):
     head = ("🔔 <b>iPhone Duo — изменение в Apple UAE</b>" if html
@@ -894,6 +916,16 @@ def check_once(cfg, notifiers, notify=True, with_pickup=True):
         pickup = {pn: list(p.get("pickup") or [])
                   for pn, p in previous.items() if p.get("pickup")}
     events = diff(previous, current, pickup, cfg.parts, cfg.threshold)
+    if previous and events and not with_pickup and cfg.city:
+        # The delivery side just moved, and a restock tends to move pickup in
+        # the same wave. This cycle was not due a pickup lookup, but waiting
+        # up to a minute for the next one is exactly the delay that costs a
+        # slot. One extra request, and only when something actually changed.
+        fresh = fetch_pickup(cfg.parts, cfg.city)
+        if fresh is not None:
+            log.info("delivery moved, so pickup was looked up at once")
+            pickup = fresh
+            events = diff(previous, current, pickup, cfg.parts, cfg.threshold)
 
     checked_at = now_iso()
     state["checked_at"] = checked_at
@@ -942,7 +974,8 @@ def check_once(cfg, notifiers, notify=True, with_pickup=True):
         if notify:
             delivered = announce(notifiers, render_alert(events),
                                  render_alert(events, html=False),
-                                 alert_markup(events))
+                                 alert_markup(events),
+                                 priority=urgency(events))
             if not delivered:
                 # Persisting now would make this change "already seen" and it
                 # would never be reported again, so the old state stays and

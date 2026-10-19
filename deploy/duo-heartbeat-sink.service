@@ -7,6 +7,7 @@ After=network.target
 Type=simple
 Environment=HEARTBEAT_FILE=/run/duo-watch/heartbeat
 Environment=LISTEN_PORT=8899
+Environment=RELEASE_DIR=/var/lib/duo-release
 ExecStart=/usr/bin/python3 -I /usr/local/lib/duo-heartbeat-sink.py
 Restart=always
 RestartSec=5
