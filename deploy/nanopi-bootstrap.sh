@@ -21,12 +21,14 @@ set -euo pipefail
 
 DEPLOY_KEY='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPilYpYgTwVWZXqmXsjsSVyjQUUC4NNONeXktQkyIzTC apple-duo-watch deploy key (claude)'
 RELEASE_SIGNER='duo-release namespaces="duo-release" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIF404TGKRw6dzz1iY3V1Axjq7Yicp9fqNXoukuwZ7VbP'
-SRC=http://172.17.0.1:8899/release
+SRC=${SRC:-http://172.17.0.1:8899/release}
 AK=/root/.ssh/authorized_keys
 
 echo "== 1. почему ключи перестали приниматься"
+echo "   (резерв на VPS последний раз достучался 2026-10-19 14:42:48 UTC,"
+echo "    с 14:43:51 UTC одни отказы: ищи, что менялось в эту минуту)"
 for p in / /root /root/.ssh "$AK"; do
-  stat -c '   %A %U:%G  %n' "$p" 2>/dev/null || echo "   (нет) $p"
+  stat -c '   %A %U:%G  изменён %y  %n' "$p" 2>/dev/null || echo "   (нет) $p"
 done
 for p in / /root /root/.ssh; do
   if [ -d "$p" ] && [ -n "$(find "$p" -maxdepth 0 -perm /022 2>/dev/null)" ]; then
@@ -49,6 +51,10 @@ echo "   последние жалобы sshd:"
 journalctl -u ssh -u sshd --since "-4 days" --no-pager 2>/dev/null \
   | grep -Ei 'bad ownership|bad modes|authentication refused|could not open|no such file' \
   | tail -5 | sed 's/^/     /' || true
+echo "   что происходило в системе в ту минуту:"
+journalctl --since "2026-10-19 14:40:00 UTC" --until "2026-10-19 14:46:00 UTC" \
+  --no-pager -o short-iso 2>/dev/null | grep -vE 'CRON|session (opened|closed)' \
+  | tail -15 | sed 's/^/     /' || true
 
 echo "== 2. возвращаю деплой-ключ"
 install -d -m 700 -o root -g root /root/.ssh
@@ -66,7 +72,7 @@ else
 fi
 if ! grep -q 'vps->nanopi read primary state' "$AK"; then
   echo "   (ограниченного ключа VPS в файле нет. Его я не возвращаю: это выдача"
-  echo "    доступа, решать владельцу. Строка с его ограничениями — в README.)"
+  echo "    доступа, решать владельцу. Как вернуть, если решишь, — в README.)"
 fi
 
 echo "== 3. ставлю самообновление из подписанного релиза"
