@@ -218,7 +218,13 @@ def fetch_delivery(parts, today):
 
 
 def fetch_pickup(parts, city):
-    """Stores where a SKU can be picked up today. Never fatal: pickup is a bonus."""
+    """Stores where a SKU can be picked up today. Never fatal: pickup is a bonus.
+
+    Returns {} for "asked, nothing available" and None for "could not ask".
+    The two must not be confused: an empty answer is news, a failed request is
+    not, and recording a failure as "pickup gone" makes the next successful
+    lookup report the very same pickup all over again.
+    """
     if not city:
         return {}
     params = {"location": city}
@@ -229,7 +235,7 @@ def fetch_pickup(parts, city):
     except (urllib.error.URLError, urllib.error.HTTPError, ValueError,
             TimeoutError) as e:
         log.warning("pickup lookup failed: %s", e)
-        return {}
+        return None
 
     out = {}
     for st in data.get("body", {}).get("stores") or []:
@@ -880,10 +886,10 @@ def check_once(cfg, notifiers, notify=True, with_pickup=True):
     if tg:
         tg.recipients = recipient_ids(state, tg.chat_id)
 
-    if with_pickup:
-        pickup = fetch_pickup(cfg.parts, cfg.city)
-    else:
-        # Carry the last known pickup forward, so skipping the lookup cannot
+    pickup = fetch_pickup(cfg.parts, cfg.city) if with_pickup else None
+    if pickup is None:
+        # Either this cycle skips the lookup, or the lookup failed. Carry the
+        # last known pickup forward: not having asked cannot be allowed to
         # read as "pickup disappeared".
         pickup = {pn: list(p.get("pickup") or [])
                   for pn, p in previous.items() if p.get("pickup")}
