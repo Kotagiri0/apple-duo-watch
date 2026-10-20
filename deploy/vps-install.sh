@@ -73,11 +73,17 @@ chmod 600 /etc/duo-deadman.env
 systemctl daemon-reload
 systemctl enable --now duo-heartbeat-sink.service
 systemctl restart duo-heartbeat-sink.service
-# One beat of our own, so a fresh install does not read as an outage before
-# the watcher has had a chance to send its first real one.
-curl -fsS --max-time 10 -o /dev/null -X POST --data-binary "installed" \
-  http://127.0.0.1:8899/beat
-rm -f /var/lib/duo-deadman/alerted
+# One beat of our own on a FRESH install only, so it does not read as an
+# outage before the watcher sends its first real one. On an update the file
+# is left alone: a fake beat there would hide a dead watcher for a while, and
+# clearing the incident flag would swallow its "back again" message.
+if [ ! -e /run/duo-watch/heartbeat ]; then
+  curl -fsS --max-time 10 -o /dev/null -X POST --data-binary "installed" \
+    http://127.0.0.1:8899/beat
+  rm -f /var/lib/duo-deadman/alerted
+fi
+# Where publish.sh puts signed releases; the sink serves them read-only.
+install -d -m 755 /var/lib/duo-releases
 systemctl enable --now duo-deadman.timer
 systemctl is-active duo-heartbeat-sink.service
 systemctl is-active duo-deadman.timer'

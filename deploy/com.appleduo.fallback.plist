@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- The fallback on this Mac. NOT loaded by default.
+
+     It starts a watcher here only when the NanoPi has been silent, and
+     stops it the moment the NanoPi answers again. With the German server
+     still answering it covers pickup only; with both silent, everything.
+
+     Enable (after merging, the path below must exist; create the log folder first):
+       mkdir -p ~/.apple-duo-watch/fallback
+       cp deploy/com.appleduo.fallback.plist ~/Library/LaunchAgents/
+       launchctl load -w ~/Library/LaunchAgents/com.appleduo.fallback.plist
+
+     It needs ~/.apple-duo-watch/fallback.env with TELEGRAM_BOT_TOKEN and
+     TELEGRAM_CHAT_ID. The token is NOT put in this file: it is read from
+     that env file at run time. -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.appleduo.fallback</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/alex/pupazalupa/deploy/fallback-mac.sh</string>
+    <string>tick</string>
+  </array>
+  <key>StartInterval</key><integer>60</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>/Users/alex/.apple-duo-watch/fallback/launchd.log</string>
+  <key>StandardErrorPath</key><string>/Users/alex/.apple-duo-watch/fallback/launchd.log</string>
+</dict>
+</plist>

@@ -1,0 +1,9 @@
+[Unit]
+Description=Pull and roll out a signed apple-duo-watch release
+Documentation=https://github.com/Kotagiri0/apple-duo-watch
+After=network-online.target docker.service telegram-tunnel.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/duo-update

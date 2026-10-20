@@ -1,0 +1,11 @@
+[Unit]
+Description=Look for a new apple-duo-watch release every five minutes
+Documentation=https://github.com/Kotagiri0/apple-duo-watch
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=5min
+RandomizedDelaySec=30s
+
+[Install]
+WantedBy=timers.target
