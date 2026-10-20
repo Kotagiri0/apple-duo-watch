@@ -315,8 +315,9 @@ sshd берёт первое прочитанное значение, а cloud-i
 перехватывал, находок не посылал, но риск этим не снят.
 
 Исправление — `deploy/primary-stamp.sh`: то же значение резерв берёт из
-heartbeat на самом VPS, без SSH. Чтобы применить (правка общего сервера, нужно
-согласие владельца):
+heartbeat на самом VPS, без SSH. Применено 20 октября 2026 года, в 15:23 UTC,
+по разрешению владельца. Так же ставится заново, если сервер будет
+переустановлен:
 
 ```sh
 scp deploy/primary-stamp.sh root@188.213.0.80:/usr/local/bin/primary-stamp.sh
@@ -326,8 +327,9 @@ ssh root@188.213.0.80 'chmod 755 /usr/local/bin/primary-stamp.sh'
 В `/etc/duo-standby.env` заменить строку `PRIMARY_SSH=…` на
 `PRIMARY_SSH=/usr/local/bin/primary-stamp.sh`, затем
 `systemctl start standby-heartbeat`. Примерно через минуту в журнале резерва
-появится `primary is answering again — going quiet`. Откат — вернуть строку
-`PRIMARY_SSH=ssh -p 2222 -i /root/.ssh/read_primary …`.
+появится `primary is answering again — going quiet`. Исходный файл сохранён на VPS как `/etc/duo-standby.env.bak-1792509822`.
+Откат — вернуть строку `PRIMARY_SSH=ssh -p 2222 -i /root/.ssh/read_primary …`
+(или восстановить файл из бэкапа) и `systemctl start standby-heartbeat`.
 
 ### ПК как резерв
 
