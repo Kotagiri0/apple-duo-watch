@@ -454,5 +454,25 @@ class SinkTest(unittest.TestCase):
         self.assertEqual((self.dir / "hb").read_text(), "8 SKUs")
 
 
+
+class OnlyKindsTest(Case):
+    """The pickup-only fallback: read everything, announce its own kind."""
+
+    def test_pickup_only_announces_pickup_and_drops_delivery(self):
+        self.check()                                    # baseline
+        with mock.patch.dict(os.environ, {"ONLY_KINDS": "pickup"}):
+            self.cfg = self.make_cfg()
+            self.store.delivery[PN] = ("Ships Dec 02", "2026-12-02")
+            self.assertEqual(self.check(), [])           # delivery: not ours
+            self.assertEqual(self.state()["parts"][PN]["date"], "2026-12-02")
+            self.store.pickup = {PN: ["Dubai Mall: Available Today"]}
+            self.assertEqual(self.check(with_pickup=True), ["PICKUP"])
+        self.assertIn("🏬", self.api.to(OWNER)[-1])
+
+    def test_unknown_kind_is_refused_at_start(self):
+        with mock.patch.dict(os.environ, {"ONLY_KINDS": "PICKUPS"}):
+            with self.assertRaises(SystemExit):
+                self.make_cfg()
+
 if __name__ == "__main__":
     unittest.main()

@@ -35,6 +35,9 @@ Configuration comes from the environment (see .env.example):
   TELEGRAM_ADMINS      comma-separated ids and/or @handles allowed to command
                        the bot besides TELEGRAM_CHAT_ID; handles are pinned to
                        an id the first time that person writes
+  ONLY_KINDS           comma-separated finding kinds to announce here (EARLIER,
+                       BUYABLE, TARGET, PICKUP, CHANGED); the rest are read and
+                       dropped. Only the Mac fallback sets it, for pickup alone
 """
 import argparse
 import collections
@@ -927,6 +930,12 @@ def check_once(cfg, notifiers, notify=True, with_pickup=True):
             pickup = fresh
             events = diff(previous, current, pickup, cfg.parts, cfg.threshold)
 
+    if cfg.only_kinds:
+        # Read everything, announce only what this instance was asked to. The
+        # dropped findings are not held back: whoever covers them has them,
+        # and holding them here would re-announce them the moment this stops.
+        events = [e for e in events if e[0] in cfg.only_kinds]
+
     checked_at = now_iso()
     state["checked_at"] = checked_at
     if tg and tg.chat_id:
@@ -1315,6 +1324,10 @@ def serve(cfg, notifiers, wd, hc, logs):
     log.info("watchdog: alerting after %ds of unbroken failure; heartbeat=%s",
              cfg.blind_after,
              f"{hc.host} every {hc.every}s" if hc.enabled else "off")
+    if cfg.only_kinds:
+        log.warning("announcing only %s here; other findings are read and "
+                    "dropped, because another watcher covers them",
+                    ", ".join(sorted(cfg.only_kinds)))
     seed_state = load_state(cfg.state_file)
     if seed_admins(cfg, seed_state):
         save_state(cfg.state_file, seed_state)
@@ -1416,6 +1429,12 @@ class Config:
         self.admin_seed = [a.strip() for a in
                            (os.environ.get("TELEGRAM_ADMINS") or "").split(",")
                            if a.strip()]
+        kinds = (os.environ.get("ONLY_KINDS") or "").strip()
+        self.only_kinds = {k.strip().upper() for k in kinds.split(",") if k.strip()}
+        unknown = self.only_kinds - set(ALERT_ICONS)
+        if unknown:
+            raise SystemExit("unknown finding kinds in ONLY_KINDS: "
+                             + ", ".join(sorted(unknown)))
         self.blind_after = int(args.blind_after
                                or os.environ.get("BLIND_AFTER_SECONDS") or 600)
         self.healthcheck_url = (os.environ.get("HEALTHCHECK_URL") or "").strip()
