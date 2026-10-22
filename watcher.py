@@ -1547,7 +1547,10 @@ class Config:
                              + ", ".join(sorted(unknown)))
         self.blind_after = int(args.blind_after
                                or os.environ.get("BLIND_AFTER_SECONDS") or 600)
-        self.role = (args.role or os.environ.get("ROLE") or "primary").strip().lower()
+        # getattr, not args.role: callers build a Namespace with only the
+        # options they care about, and a new flag must not break them.
+        self.role = (getattr(args, "role", None)
+                     or os.environ.get("ROLE") or "primary").strip().lower()
         if self.role not in ("primary", "standby"):
             raise SystemExit(f'ROLE must be "primary" or "standby", not {self.role!r}')
         self.primary_cmd = (os.environ.get("PRIMARY_HEARTBEAT_CMD") or "").strip()
