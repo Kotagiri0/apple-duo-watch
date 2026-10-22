@@ -151,6 +151,33 @@ def standby_state(index):
     return state, info
 
 
+def watcher_role(info):
+    """'primary' or 'standby', as the container was started with; None if unknown.
+
+    Only the ROLE entry is kept. The rest of the environment, tokens included,
+    is not stored anywhere.
+    """
+    if info is None:
+        return None
+    env = (info["cfg"].get("Config") or {}).get("Env") or []
+    for entry in env:
+        if entry.startswith("ROLE="):
+            role = entry[len("ROLE="):].strip().lower()
+            return role if role in ("primary", "standby") else None
+    return None
+
+
+def primary_beat(role, checked_age, sink):
+    """What the page judges the primary by.
+
+    While the primary runs in this container, its last successful Apple poll is
+    its heartbeat. Otherwise it is the heartbeat the sink wrote from a home machine.
+    """
+    if role == "primary" and checked_age is not None:
+        return {"age": checked_age, "skus": None, "earliest": None}
+    return sink
+
+
 class LogTail:
     """Counts events in the standby's json log, incrementally, across rotations."""
 
@@ -165,10 +192,12 @@ class LogTail:
     def follow(self, container_dir):
         if container_dir != self.dir:
             # A recreated container has a new id and a new log: count it from its start.
+            # A watcher starts quiet, so the old container's last transition no longer holds.
             self.dir = container_dir
             self.path = container_dir / f"{container_dir.name}-json.log"
             self.offset = 0
             self.inode = None
+            self.mode = 0
 
     def poll(self):
         if self.path is None:
@@ -292,9 +321,17 @@ def collect(app):
     m.add("duo_fleet_last_update_timestamp_seconds", "gauge",
           "When the fleet exporter last collected.", now)
 
-    hb = read_heartbeat()
+    state_doc, standby = standby_state(app.index)
+    doc = state_doc or {}
+    role = watcher_role(standby)
+    checked_age = None
+    if doc.get("checked_at"):
+        checked_age = max(0.0, now - parse_iso(doc["checked_at"]).timestamp())
+
+    hb = primary_beat(role, checked_age, read_heartbeat())
     m.add("duo_heartbeat_age_seconds", "gauge",
-          "Seconds since the primary watcher's last heartbeat; -1 if there is none.",
+          "Seconds since the primary's last successful Apple poll; -1 if there is none. "
+          "While the primary runs in Germany this is that container's poll, else the sink heartbeat.",
           hb["age"] if hb else -1)
     if hb:
         m.add("duo_heartbeat_skus", "gauge",
@@ -304,8 +341,10 @@ def collect(app):
     m.add("duo_deadman_incident", "gauge",
           "1 while the deadman has an open 'watcher silent' incident.",
           1 if DEADMAN_FLAG.exists() else 0)
+    m.add("duo_standby_container_primary", "gauge",
+          "1 if the container in Germany runs with ROLE=primary, 0 if as standby.",
+          None if role is None else int(role == "primary"))
 
-    state_doc, standby = standby_state(app.index)
     amnezia = app.index.info(AMNEZIA_NAME)
     for label, info in (("standby", standby), ("amnezia", amnezia)):
         m.add("duo_container_running", "gauge", "1 if the container is running.",
@@ -314,11 +353,8 @@ def collect(app):
             m.add("duo_container_started_timestamp_seconds", "gauge",
                   "When the container last started.", info["started"], {"name": label})
 
-    doc = state_doc or {}
-    if doc.get("checked_at"):
-        m.add("duo_standby_checked_age_seconds", "gauge",
-              "Seconds since the standby's last successful Apple poll.",
-              max(0.0, now - parse_iso(doc["checked_at"]).timestamp()))
+    m.add("duo_standby_checked_age_seconds", "gauge",
+          "Seconds since the container's last successful Apple poll.", checked_age)
     for subject, rec in (doc.get("health") or {}).items():
         m.add("duo_standby_health_fail_streak", "gauge",
               "Failures in a row for this subject, as the standby sees it.",

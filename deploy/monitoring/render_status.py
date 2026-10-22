@@ -119,6 +119,7 @@ def gather():
         "hb_earliest": scalar("duo_heartbeat_earliest_timestamp_seconds"),
         "deadman": scalar("duo_deadman_incident", 0),
         "standby_running": scalar('duo_container_running{name="standby"}'),
+        "standby_primary": scalar("duo_standby_container_primary"),
         "amnezia_running": scalar('duo_container_running{name="amnezia"}'),
         "standby_mode": scalar("duo_standby_mode", -1),
         "standby_checked_age": scalar("duo_standby_checked_age_seconds"),
@@ -148,16 +149,21 @@ def assess(d):
         red.append("сервер в Германии не отдаёт метрики")
     hb = d["hb_age"]
     silent = hb is None or hb < 0 or hb > DEADMAN_SILENT_SECONDS
-    if silent and d["standby_mode"] != 1:
+    if d["standby_primary"] == 1:
+        # The primary is the container here, so no other watcher stands by to take over.
+        if silent:
+            red.append("основной в Германии молчит: никто не ведёт доставку")
+    elif silent and d["standby_mode"] != 1:
         red.append("основной молчит, и резерв не ведёт доставку")
     elif silent:
         yellow.append("основной молчит: доставку ведёт резерв в Германии")
     if d["deadman"] == 1:
         yellow.append("деадман: открыт инцидент «наблюдатель молчит»")
     if d["standby_running"] != 1:
-        yellow.append("контейнер резерва не запущен")
+        yellow.append("контейнер наблюдателя в Германии не запущен")
     if d["fail"].get("apple", 0) > 0:
-        yellow.append(f"резерв: неудач опроса Apple подряд {int(d['fail']['apple'])}")
+        yellow.append("наблюдатель в Германии: неудач опроса Apple подряд "
+                      f"{int(d['fail']['apple'])}")
     for name, value in sorted(d["tcp"].items()):
         if not value:
             yellow.append(f"{name}: порт недоступен")
@@ -281,7 +287,7 @@ def servers_section(d):
         f" · диск {num(d['disk'], unit='%')}"
         f"<div class='muted'>нагрузка {num(d['load1'], '{:.2f}')} на {int(cores)} ядро"
         f" · аптайм {duration(d['uptime'])}</div></td>"
-        f"<td>резерв {on(d['standby_running'] == 1)} · amnezia {on(d['amnezia_running'] == 1)}"
+        f"<td>наблюдатель {on(d['standby_running'] == 1)} · amnezia {on(d['amnezia_running'] == 1)}"
         f"<div class='muted'>sink {on(d['services'].get('sink'))}"
         f" · tinyproxy {on(d['services'].get('tinyproxy'))}"
         f" · sshd {on(d['services'].get('sshd'))}"
@@ -304,27 +310,36 @@ def servers_section(d):
 def watchers_section(d):
     hb = d["hb_age"]
     silent = hb is None or hb < 0 or hb > DEADMAN_SILENT_SECONDS
-    mode = {1: "перехват — ведёт доставку", 0: "тихий — ждёт", -1: "неизвестно"}.get(
-        int(d["standby_mode"]), "неизвестно")
     ev = {k: int(v) for k, v in d["events"].items()}
+    in_germany = d["standby_primary"] == 1
+    source = ("источник удара: последний удачный опрос Apple в контейнере" if in_germany
+              else "источник удара: не различается, все пишут в один канал")
+    apple_line = f"последний опрос Apple: {ago(d['standby_checked_age'])}"
+    fails_line = (f"неудач подряд: Apple {int(d['fail'].get('apple', 0))},"
+                  f" Telegram {int(d['fail'].get('telegram', 0))}")
+    if in_germany:
+        own_card = card("Контейнер в Германии", [
+            "роль: основной, резервного наблюдателя сейчас нет",
+            apple_line,
+            fails_line,
+        ])
+    else:
+        mode = {1: "перехват — ведёт доставку", 0: "тихий — ждёт", -1: "неизвестно"}.get(
+            int(d["standby_mode"]), "неизвестно")
+        own_card = card("Резерв в Германии", [f"режим: {mode}", apple_line, fails_line])
     cards = [
         card("Основной наблюдатель", [
             f"heartbeat: {ago(hb) if hb is not None and hb >= 0 else 'удара не было'}",
             "состояние: " + ("молчит" if silent else "работает"),
-            "источник удара: не различается, все пишут в один канал",
+            source,
             f"в ударе: {int(d['hb_skus'])} конфигураций" if d["hb_skus"] is not None else "",
             f"самый ранний срок: {ts_text(d['hb_earliest'])}" if d["hb_earliest"] else "",
         ]),
-        card("Резерв в Германии", [
-            f"режим: {mode}",
-            f"последний опрос Apple: {ago(d['standby_checked_age'])}",
-            f"неудач подряд: Apple {int(d['fail'].get('apple', 0))},"
-            f" Telegram {int(d['fail'].get('telegram', 0))}",
-        ]),
+        own_card,
         card("Деадман", [
             "инцидент открыт" if d["deadman"] == 1 else "инцидентов нет",
         ]),
-        card("Журнал резерва (текущий файл лога)", [
+        card("Журнал контейнера в Германии (текущий файл лога)", [
             f"опросов Apple (ok): {ev.get('ok_poll', 0)}",
             f"конфликтов 409: {ev.get('conflict', 0)}",
             f"находок: {ev.get('finding', 0)}",

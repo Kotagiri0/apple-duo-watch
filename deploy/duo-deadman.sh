@@ -13,6 +13,8 @@
 #   TELEGRAM_CHAT_ID    chat for the above
 #   STALE_AFTER         seconds of silence before alerting (default 900)
 #   HEARTBEAT_FILE      file the sink rewrites (/run/duo-watch/heartbeat)
+#   STATE_JSON          the standby's state.json; its checked_at is the heartbeat
+#                       and wins over HEARTBEAT_FILE when set
 set -uo pipefail
 
 ENV_FILE=${ENV_FILE:-/etc/duo-deadman.env}
@@ -20,6 +22,7 @@ ENV_FILE=${ENV_FILE:-/etc/duo-deadman.env}
 [[ -f $ENV_FILE ]] && . "$ENV_FILE"
 
 HEARTBEAT_FILE=${HEARTBEAT_FILE:-/run/duo-watch/heartbeat}
+STATE_JSON=${STATE_JSON:-}
 STALE_AFTER=${STALE_AFTER:-900}
 FLAG=${FLAG:-/var/lib/duo-deadman/alerted}
 NTFY_URL=${NTFY_URL:-}
@@ -63,7 +66,19 @@ say() {
 }
 
 now=$(date +%s)
-if [[ -f $HEARTBEAT_FILE ]]; then
+if [[ -n $STATE_JSON ]]; then
+  # The standby's own state. checked_at is written only after Apple answered,
+  # so it measures what the sink heartbeat measured: successful polls.
+  beat=$(python3 -I -c 'import datetime, json, sys
+print(int(datetime.datetime.fromisoformat(json.load(open(sys.argv[1]))["checked_at"]).timestamp()))' "$STATE_JSON" 2>/dev/null)
+  if [[ -n $beat ]]; then
+    silent=$(( now - beat ))
+    last=$(date -d "@$beat" --iso-8601=seconds)
+  else
+    silent=$(( STALE_AFTER + 1 ))
+    last="никогда (в $STATE_JSON нет checked_at)"
+  fi
+elif [[ -f $HEARTBEAT_FILE ]]; then
   beat=$(stat -c %Y "$HEARTBEAT_FILE")
   silent=$(( now - beat ))
   last=$(date -d "@$beat" --iso-8601=seconds)

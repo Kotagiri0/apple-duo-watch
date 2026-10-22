@@ -123,6 +123,20 @@ class LogTailTest(unittest.TestCase):
         tail.poll()
         self.assertEqual(tail.totals["ok_poll"], 2)
 
+    def test_a_recreated_container_starts_quiet_not_in_the_old_takeover(self):
+        self.write("WARNING primary went quiet (опрашивал 5 мин назад) — taking over alerts")
+        tail = fleet.LogTail()
+        tail.follow(self.container)
+        tail.poll()
+        self.assertEqual(tail.mode, 1)
+        newer = self.dir / "def456"
+        newer.mkdir()
+        (newer / "def456-json.log").write_text(log_line("INFO ok — 8 SKUs"), encoding="utf-8")
+        tail.follow(newer)
+        tail.poll()
+        self.assertEqual(tail.mode, 0)
+        self.assertEqual(tail.totals["takeover"], 1)  # the count is kept, the mode is not
+
 
 class HeartbeatTest(unittest.TestCase):
     def test_reads_age_and_body(self):
@@ -152,6 +166,7 @@ def fixture(**overrides):
         "node_up": 1, "cpu": 12.0, "ram": 40.0, "disk": 30.0, "load1": 0.1,
         "cores": 1, "uptime": 400000, "hb_age": 20.0, "hb_skus": 8.0,
         "hb_earliest": 1798000000.0, "deadman": 0, "standby_running": 1,
+        "standby_primary": 0.0,
         "amnezia_running": 1, "standby_mode": 0, "standby_checked_age": 30.0,
         "fail": {"apple": 0.0, "telegram": 0.0}, "tcp": {"nanopi_ssh": 0.0, "pc_ssh": 1.0},
         "services": {"sink": 1.0, "tinyproxy": 1.0, "sshd": 1.0}, "telegram": 1.0,
@@ -248,6 +263,42 @@ class ExporterOutputTest(unittest.TestCase):
         self.assertIn('# TYPE duo_test gauge', text)
         self.assertIn('duo_test{name="x"} 1', text)
         self.assertNotIn("duo_none", text)
+
+
+class PrimaryInGermanyTest(unittest.TestCase):
+    """While the primary is the container here, its own Apple poll is the heartbeat."""
+
+    def test_the_primary_beat_is_the_last_poll_when_the_primary_is_here(self):
+        sink = {"age": 2000.0, "skus": 8, "earliest": 1.0}
+        beat = fleet.primary_beat("primary", 30.0, sink)
+        self.assertEqual(beat["age"], 30.0)
+        self.assertIsNone(beat["skus"])
+
+    def test_the_primary_beat_is_the_sink_otherwise(self):
+        sink = {"age": 2000.0, "skus": 8, "earliest": 1.0}
+        self.assertIs(fleet.primary_beat("standby", 30.0, sink), sink)
+        self.assertIs(fleet.primary_beat("primary", None, sink), sink)
+        self.assertIsNone(fleet.primary_beat("standby", None, None))
+
+    def test_only_the_role_is_read_from_the_environment(self):
+        info = {"cfg": {"Config": {"Env": ["TELEGRAM_BOT_TOKEN=not-a-real-token", "ROLE=primary"]}}}
+        self.assertEqual(fleet.watcher_role(info), "primary")
+        self.assertIsNone(fleet.watcher_role({"cfg": {"Config": {"Env": ["ROLE=other"]}}}))
+        self.assertIsNone(fleet.watcher_role(None))
+
+    def test_a_silent_primary_in_germany_is_red(self):
+        level, _ = render.assess(fixture(standby_primary=1.0, hb_age=2000.0, standby_mode=-1))
+        self.assertEqual(level, "red")
+
+    def test_a_healthy_primary_in_germany_is_green(self):
+        everything_up = fixture(standby_primary=1.0, hb_age=20.0, standby_mode=-1,
+                                tcp={"nanopi_ssh": 1.0, "pc_ssh": 1.0})
+        self.assertEqual(render.assess(everything_up), ("green", []))
+
+    def test_the_page_shows_the_container_as_primary(self):
+        html_text = render.page(fixture(standby_primary=1.0, standby_mode=-1))
+        self.assertIn("Контейнер в Германии", html_text)
+        self.assertNotIn("режим: перехват", html_text)
 
 
 if __name__ == "__main__":
