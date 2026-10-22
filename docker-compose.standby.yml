@@ -1,0 +1,20 @@
+# The standby instance: same image, different role, plus a read-only view of
+# the primary's heartbeat that the host refreshes on a timer.
+services:
+  watcher:
+    build: .
+    image: apple-duo-watch
+    container_name: apple-duo-watch-standby
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - duo-standby-state:/data
+      - /var/lib/duo-standby:/primary:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  duo-standby-state:

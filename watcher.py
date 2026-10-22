@@ -24,6 +24,14 @@ Configuration comes from the environment (see .env.example):
   BLIND_AFTER_SECONDS  warn that the watcher went blind after this many seconds
                        of unbroken failure (default 600); one alert per
                        incident, plus one when it clears
+  ROLE                 "primary" (default) or "standby". A standby polls Apple
+                       from its own address but stays silent while the primary
+                       is alive, and takes over when it goes quiet — insurance
+                       against the primary's IP being rate-limited
+  PRIMARY_HEARTBEAT_CMD  shell command a standby runs to read the primary's
+                       last successful poll, as an ISO timestamp on stdout
+  PRIMARY_STALE_SECONDS  take over once that timestamp is this old (default 300)
+  PRIMARY_CHECK_EVERY  seconds between heartbeat reads (default 60)
   HEALTHCHECK_URL      outside watchdog pinged after every successful cycle,
                        so that something notices if this process dies or the
                        machine goes off, which no in-process alarm can
@@ -48,6 +56,7 @@ import os
 import random
 import re
 import signal
+import subprocess
 import sys
 import time
 import urllib.error
@@ -593,6 +602,75 @@ class Healthcheck:
             self.fail_streak = 0
             self.last_ok = now_iso()
         return ok
+
+
+class Primary:
+    """A standby's view of whether the primary watcher is still working.
+
+    The timestamp it reads only advances after a *successful* Apple poll, so a
+    primary whose address got rate-limited goes stale while its process is
+    still alive — which is exactly the case a standby exists for.
+    """
+
+    def __init__(self, cmd, stale_after=300, every=60):
+        self.cmd = (cmd or "").strip()
+        self.stale_after = stale_after
+        self.every = max(5, every)
+        self.seen = None          # last timestamp successfully read
+        self.read_at = 0.0        # monotonic time of that read
+        self.failures = 0
+        self.active = False       # is this instance the one alerting?
+
+    @property
+    def enabled(self):
+        return bool(self.cmd)
+
+    def _read(self):
+        out = subprocess.run(self.cmd, shell=True, capture_output=True,
+                             text=True, timeout=30)
+        if out.returncode != 0:
+            raise RuntimeError((out.stderr or out.stdout or "").strip()
+                               or f"exit {out.returncode}")
+        stamp = parse_iso(out.stdout.strip())
+        if stamp is None:
+            raise RuntimeError(f"unparsable heartbeat: {out.stdout.strip()[:80]!r}")
+        return stamp
+
+    def poll(self):
+        """Refresh at most every `every` seconds. Returns True when stale."""
+        now = time.monotonic()
+        if self.seen is not None and now - self.read_at < self.every:
+            return self.stale()
+        try:
+            self.seen = self._read()
+            self.read_at = now
+            if self.failures:
+                log.info("primary heartbeat readable again (%s)",
+                         self.seen.isoformat())
+            self.failures = 0
+        except (subprocess.SubprocessError, RuntimeError, OSError) as e:
+            self.failures += 1
+            self.read_at = now
+            if self.failures in (1, 5) or self.failures % 30 == 0:
+                log.warning("cannot read primary heartbeat (%d in a row): %s",
+                            self.failures, e)
+            # An unreadable primary is a reason to take over, not to assume
+            # all is well — but only once it has failed a few times, so one
+            # dropped ssh connection does not flip the roles.
+            if self.failures >= 3:
+                self.seen = None
+        return self.stale()
+
+    def stale(self):
+        if self.seen is None:
+            return self.failures >= 3
+        return (dt.datetime.now(dt.timezone.utc) - self.seen
+                ).total_seconds() > self.stale_after
+
+    def describe(self):
+        if self.seen is None:
+            return "недоступен" if self.failures else "ещё не читался"
+        return f"опрашивал {ago(self.seen.isoformat())}"
 
 
 def announce(notifiers, html, text, markup=None, priority=None):
@@ -1321,6 +1399,8 @@ def dispatch(rt, tg, state, cmd, text, chat_id, username):
 def serve(cfg, notifiers, wd, hc, logs):
     tg = next((n for n in notifiers if isinstance(n, Telegram)), None)
     rt = Runtime(cfg, notifiers, hc, logs)
+    primary = Primary(cfg.primary_cmd, cfg.primary_stale, cfg.primary_every)
+    standby = cfg.role == "standby"
     stop = {"now": False}
 
     def _stop(signum, _frame):
@@ -1358,18 +1438,44 @@ def serve(cfg, notifiers, wd, hc, logs):
     if load_state(cfg.state_file).get("paused"):
         log.warning("notifications are paused (/resume to turn them back on); "
                     "findings are still recorded")
-    if tg and tg.enabled:
+    if standby:
+        log.info("role=standby — silent while the primary answers; taking over "
+                 "once its last poll is older than %ds (checked every %ds)",
+                 cfg.primary_stale, cfg.primary_every)
+    if tg and tg.enabled and not standby:
         # Puts the commands in Telegram's own menu, so they are discoverable
-        # without reading the README.
+        # without reading the README. A standby must not touch the menu: the
+        # primary owns it, and both share one bot.
         tg.set_commands(COMMANDS)
 
     backoff = 0
     cycle = 0
     while not stop["now"]:
         started = time.monotonic()
+        if standby:
+            was = primary.active
+            primary.active = primary.poll()
+            if primary.active and not was:
+                log.warning("primary went quiet (%s) — taking over alerts",
+                            primary.describe())
+                announce(notifiers,
+                         "🛟 <b>Беру наблюдение на себя.</b>\nОсновной наблюдатель "
+                         f"молчит: {esc(primary.describe())}.\nСледить продолжаю "
+                         "со своего адреса, уведомления теперь идут отсюда.",
+                         "🛟 Беру наблюдение на себя. Основной молчит: "
+                         f"{primary.describe()}.")
+            elif was and not primary.active:
+                log.info("primary is answering again (%s) — going quiet",
+                         primary.describe())
+                announce(notifiers,
+                         "✅ <b>Основной наблюдатель снова работает.</b>\n"
+                         f"Он {esc(primary.describe())}. Снова ухожу в резерв "
+                         "и молчу.",
+                         "✅ Основной наблюдатель снова работает. Ухожу в резерв.")
         try:
             events, current, pickup = check_once(
-                cfg, notifiers, with_pickup=(cycle % cfg.pickup_every == 0))
+                cfg, notifiers, notify=(not standby or primary.active),
+                with_pickup=(cycle % cfg.pickup_every == 0))
             cycle += 1
             rt.current, rt.pickup, rt.checked_at = current, pickup, now_iso()
             rt.cycles = cycle
@@ -1392,7 +1498,11 @@ def serve(cfg, notifiers, wd, hc, logs):
             backoff = min(backoff * 2 or cfg.interval, 900)
             wd.record("apple", False, e, notifiers=notifiers)
 
-        if tg and tg.enabled:
+        # Both roles share one bot token, and getUpdates hands each update to
+        # whoever asks first — so a standby that polled while the primary was
+        # alive would steal commands at random. It only serves them once it
+        # has taken over.
+        if tg and tg.enabled and (not standby or primary.active):
             try:
                 handle_commands(rt, tg)
             except Exception:
@@ -1453,6 +1563,15 @@ class Config:
                              + ", ".join(sorted(unknown)))
         self.blind_after = int(args.blind_after
                                or os.environ.get("BLIND_AFTER_SECONDS") or 600)
+        # getattr, not args.role: callers build a Namespace with only the
+        # options they care about, and a new flag must not break them.
+        self.role = (getattr(args, "role", None)
+                     or os.environ.get("ROLE") or "primary").strip().lower()
+        if self.role not in ("primary", "standby"):
+            raise SystemExit(f'ROLE must be "primary" or "standby", not {self.role!r}')
+        self.primary_cmd = (os.environ.get("PRIMARY_HEARTBEAT_CMD") or "").strip()
+        self.primary_stale = int(os.environ.get("PRIMARY_STALE_SECONDS") or 300)
+        self.primary_every = int(os.environ.get("PRIMARY_CHECK_EVERY") or 60)
         self.healthcheck_url = (os.environ.get("HEALTHCHECK_URL") or "").strip()
         self.healthcheck_every = int(
             os.environ.get("HEALTHCHECK_EVERY_SECONDS") or 60)
@@ -1462,6 +1581,9 @@ class Config:
         if not self.healthcheck_url:
             log.warning("HEALTHCHECK_URL is unset: an in-process watchdog "
                         "cannot report that the process itself died")
+        if self.role == "standby" and not self.primary_cmd:
+            raise SystemExit("ROLE=standby needs PRIMARY_HEARTBEAT_CMD, "
+                             "otherwise it cannot tell whether to take over")
 
 
 def main(argv=None):
@@ -1478,6 +1600,8 @@ def main(argv=None):
                     help="comma-separated part numbers to watch")
     ap.add_argument("--pickup-every", type=int, default=None, metavar="N",
                     help="look up in-store pickup every Nth cycle")
+    ap.add_argument("--role", default=None, choices=("primary", "standby"),
+                    help="standby stays silent while the primary is alive")
     ap.add_argument("--blind-after", type=int, default=None, metavar="SECONDS",
                     help="warn after this long without a successful check")
     args = ap.parse_args(argv)

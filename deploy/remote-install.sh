@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Install (or update) the watcher on a server over SSH.
 #
-#   ./deploy/remote-install.sh [-p PORT] [-i IDENTITY] user@host [remote-dir]
+#   ./deploy/remote-install.sh [-p PORT] [-i IDENTITY] [-e ENVFILE] user@host [remote-dir]
 #
 # Copies the service and your .env with rsync, then builds and starts it with
 # docker compose; installs Docker first if the host has none. Re-running this
@@ -12,11 +12,14 @@ set -euo pipefail
 PORT=${SSH_PORT:-22}
 IDENTITY=${SSH_IDENTITY:-}
 
-while getopts ":p:i:" opt; do
+ENVFILE=${ENVFILE:-}
+
+while getopts ":p:i:e:" opt; do
   case $opt in
     p) PORT=$OPTARG ;;
     i) IDENTITY=$OPTARG ;;
-    *) echo "usage: $0 [-p PORT] [-i IDENTITY] user@host [remote-dir]" >&2; exit 2 ;;
+    e) ENVFILE=$OPTARG ;;
+    *) echo "usage: $0 [-p PORT] [-i IDENTITY] [-e ENVFILE] user@host [remote-dir]" >&2; exit 2 ;;
   esac
 done
 shift $((OPTIND - 1))
@@ -34,13 +37,17 @@ ssh_run 'echo "connected to $(hostname)"'
 
 # The token can live here or already on the server. Keeping a second copy of
 # it on your laptop is optional: an update does not need to resend the .env.
+# A second instance — the standby on another host — is this same image with
+# another env file, so -e says which local file is installed as .env there.
+ENVFILE=${ENVFILE:-$HERE/.env}
+[[ $ENVFILE = /* ]] || ENVFILE=$HERE/$ENVFILE
 SEND_ENV=1
-if [[ ! -f "$HERE/.env" ]]; then
+if [[ ! -f "$ENVFILE" ]]; then
   if ssh_run "grep -qE '^TELEGRAM_BOT_TOKEN=.+' '$REMOTE_DIR/.env'" 2>/dev/null; then
     echo "==> keeping the .env already in $TARGET:$REMOTE_DIR"
     SEND_ENV=0
   else
-    echo "error: $HERE/.env is missing — copy .env.example to .env and put the bot token in it" >&2
+    echo "error: $ENVFILE is missing — copy an .env.example to it and put the bot token in it" >&2
     exit 1
   fi
 fi
@@ -61,7 +68,7 @@ rsync -az -e "ssh ${SSH_OPTS[*]}" \
   "$HERE/watcher.py" "$HERE/Dockerfile" "$HERE/docker-compose.yml" \
   "$TARGET:$REMOTE_DIR/"
 if (( SEND_ENV )); then
-  rsync -az -e "ssh ${SSH_OPTS[*]}" "$HERE/.env" "$TARGET:$REMOTE_DIR/"
+  rsync -az -e "ssh ${SSH_OPTS[*]}" "$ENVFILE" "$TARGET:$REMOTE_DIR/.env"
 fi
 ssh_run "chmod 600 '$REMOTE_DIR/.env'"
 

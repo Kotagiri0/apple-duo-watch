@@ -1,0 +1,9 @@
+[Unit]
+Description=Fetch the primary watcher's heartbeat for the standby
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/duo-standby.env
+ExecStart=/usr/local/bin/standby-heartbeat.sh

@@ -509,5 +509,68 @@ class PickupRulesTest(unittest.TestCase):
         self.assertEqual(got, {"MK244AH/A": ["Yas Mall: Available Today"]})
 
 
+# ------------------------------------------------------------------- standby
+
+class StandbyTest(Case):
+    """A standby must stay quiet while the primary works, and only then speak.
+
+    The heartbeat it reads advances only after a successful Apple poll, so a
+    primary that is alive but rate-limited looks the same as a dead one —
+    which is the whole point of the role.
+    """
+
+    def primary(self, cmd, **kw):
+        return w.Primary(cmd, kw.get("stale_after", 300), kw.get("every", 0))
+
+    def test_fresh_heartbeat_keeps_the_standby_quiet(self):
+        fresh = self.primary(f"echo {w.now_iso()}")
+        self.assertFalse(fresh.poll())
+
+    def test_old_heartbeat_hands_over(self):
+        old = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=3)
+        self.assertTrue(self.primary(f"echo {old.isoformat()}").poll())
+
+    def test_one_failed_read_is_not_a_handover(self):
+        # A dropped ssh connection must not flip the roles; three in a row may.
+        p = self.primary("exit 7")
+        self.assertFalse(p.poll(), "took over after a single failed read")
+        self.assertFalse(p.poll())
+        self.assertTrue(p.poll(), "never took over despite a dead heartbeat")
+
+    def test_unparsable_heartbeat_counts_as_a_failure(self):
+        p = self.primary("echo not-a-timestamp")
+        for _ in range(3):
+            p.poll()
+        self.assertTrue(p.stale())
+
+    def test_recovery_goes_quiet_again(self):
+        old = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=3)
+        p = w.Primary(f"echo {old.isoformat()}", 300, 0)
+        self.assertTrue(p.poll())
+        p.cmd = f"echo {w.now_iso()}"
+        # poll() refreshes at most every `every` seconds. Zeroing read_at is
+        # not enough — time.monotonic() can start near zero — so drop the
+        # throttle itself instead of sleeping through it.
+        p.every = 0
+        self.assertFalse(p.poll(), "stayed active after the primary came back")
+
+    def test_standby_role_needs_a_heartbeat_command(self):
+        os.environ.pop("PRIMARY_HEARTBEAT_CMD", None)
+        with self.assertRaises(SystemExit):
+            self.make_cfg(role="standby")
+
+    def test_suppressed_findings_still_move_the_state_and_history(self):
+        # Without this, a standby would dump every change since boot the
+        # moment it takes over.
+        self.check()                                  # baseline
+        self.api.sent.clear()                         # drops the welcome
+        self.store.delivery[PN] = ("Ships Nov 03", "2026-11-03")
+        self.assertEqual(self.check(notify=False), ["EARLIER"])
+        self.assertFalse(self.api.sent, "a suppressed standby sent a message")
+        self.assertEqual(self.state()["parts"][PN]["label"], "Ships Nov 03")
+        self.assertEqual(self.check(notify=False), [],
+                         "the same finding came back after being recorded")
+
+
 if __name__ == "__main__":
     unittest.main()
