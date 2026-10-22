@@ -223,6 +223,22 @@ def fetch_delivery(parts, today):
     return out
 
 
+# Apple says "Check back for availability on 23/10" for a store that will get the
+# phone later. That is a future date, not stock, and it must not read as pickup.
+# Judged by the quote, because that is what the state file keeps.
+AVAILABLE_RE = re.compile(r"\bavailable\b", re.IGNORECASE)
+NOT_NOW_RE = re.compile(r"unavailable|check back", re.IGNORECASE)
+
+
+def pickup_available(display, quote):
+    """Can this store hand the phone over today?"""
+    if display == "unavailable" or not quote:
+        return False
+    if NOT_NOW_RE.search(quote):
+        return False
+    return display == "available" or bool(AVAILABLE_RE.search(quote))
+
+
 def fetch_pickup(parts, city):
     """Stores where a SKU can be picked up today. Never fatal: pickup is a bonus.
 
@@ -249,12 +265,12 @@ def fetch_pickup(parts, city):
         for pn, info in (st.get("partsAvailability") or {}).items():
             if pn not in parts:
                 continue
-            status = (info.get("pickupDisplay") or "").lower()
-            if status and status != "unavailable":
-                quote = (info.get("pickupSearchQuote")
-                         or info.get("messageTypes", {})
-                            .get("regular", {}).get("storePickupQuote")
-                         or status)
+            display = (info.get("pickupDisplay") or "").lower()
+            quote = (info.get("pickupSearchQuote")
+                     or info.get("messageTypes", {})
+                        .get("regular", {}).get("storePickupQuote")
+                     or display)
+            if pickup_available(display, quote):
                 out.setdefault(pn, []).append(f"{name}: {quote}")
     return out
 
