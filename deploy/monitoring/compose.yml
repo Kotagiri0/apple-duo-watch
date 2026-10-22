@@ -1,0 +1,72 @@
+# Monitoring stack for the German server. Four containers, all on the host
+# network, all bound to 127.0.0.1. Nothing is published: look at the page
+# through an SSH tunnel (see README.md). Read-only mounts only, so the stack
+# cannot change the watchers, the sink, the deadman or the VPN.
+name: duo-monitoring
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    network_mode: host
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=30d
+      - --storage.tsdb.retention.size=1GB
+      - --web.listen-address=127.0.0.1:9090
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    mem_limit: 400m
+    restart: unless-stopped
+    logging: *logging
+
+  node-exporter:
+    image: prom/node-exporter:v1.8.2
+    network_mode: host
+    command:
+      - --path.rootfs=/host
+      - --web.listen-address=127.0.0.1:9100
+    volumes:
+      - /:/host:ro,rslave
+    mem_limit: 96m
+    restart: unless-stopped
+    logging: *logging
+
+  fleet-exporter:
+    image: python:3.12-slim
+    network_mode: host
+    command: ["python3", "-I", "/app/fleet_exporter.py"]
+    environment:
+      LISTEN: 127.0.0.1:9877
+    volumes:
+      - ./fleet_exporter.py:/app/fleet_exporter.py:ro
+      - /run/duo-watch:/host/duo-watch:ro
+      - /var/lib/duo-deadman:/host/deadman:ro
+      - /var/lib/docker/containers:/host/containers:ro
+      - /var/lib/docker/volumes:/host/volumes:ro
+    mem_limit: 128m
+    restart: unless-stopped
+    logging: *logging
+
+  status-page:
+    image: python:3.12-slim
+    network_mode: host
+    command: ["python3", "-I", "/app/render_status.py"]
+    environment:
+      LISTEN: 127.0.0.1:8080
+      PROM: http://127.0.0.1:9090
+    volumes:
+      - ./render_status.py:/app/render_status.py:ro
+    mem_limit: 128m
+    restart: unless-stopped
+    logging: *logging
+
+volumes:
+  prometheus-data:

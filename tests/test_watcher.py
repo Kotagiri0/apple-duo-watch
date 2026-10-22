@@ -474,6 +474,41 @@ class OnlyKindsTest(Case):
             with self.assertRaises(SystemExit):
                 self.make_cfg()
 
+class PickupRulesTest(unittest.TestCase):
+    """Apple's real wording: a future date ('Check back ... 23/10') is not stock."""
+
+    def test_display_and_quote_combinations(self):
+        cases = [
+            ("default", "Check back for availability on 23/10", False),
+            ("unavailable", "Unavailable for Pickup", False),
+            ("default", "Available Today", True),
+            ("available", "available", True),
+            ("", "", False),
+            ("default", "", False),
+        ]
+        for display, quote, want in cases:
+            self.assertEqual(w.pickup_available(display, quote), want, (display, quote))
+
+    def test_the_real_check_back_payload_yields_no_pickup(self):
+        resp = {"body": {"stores": [{"storeName": "Dubai Mall", "partsAvailability": {
+            "MK244AH/A": {
+                "pickupDisplay": "default",
+                "pickupSearchQuote": "Check back for availability on 23/10",
+                "messageTypes": {"regular": {
+                    "storePickupQuote": "Check back for availability on 23/10"}}}}}]}}
+        with mock.patch.object(w, "_shop_json", lambda path, params: resp):
+            got = WatcherSource.fetch_pickup({"MK244AH/A": ("x", 1)}, "Dubai")
+        self.assertEqual(got, {})
+
+    def test_an_available_store_still_counts(self):
+        resp = {"body": {"stores": [{"storeName": "Yas Mall", "partsAvailability": {
+            "MK244AH/A": {"pickupDisplay": "default",
+                          "pickupSearchQuote": "Available Today"}}}]}}
+        with mock.patch.object(w, "_shop_json", lambda path, params: resp):
+            got = WatcherSource.fetch_pickup({"MK244AH/A": ("x", 1)}, "Dubai")
+        self.assertEqual(got, {"MK244AH/A": ["Yas Mall: Available Today"]})
+
+
 # ------------------------------------------------------------------- standby
 
 class StandbyTest(Case):

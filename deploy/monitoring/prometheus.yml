@@ -1,0 +1,14 @@
+# Prometheus scrape config for the German server. Every target is on loopback:
+# nothing here is reachable from outside the machine.
+global:
+  scrape_interval: 30s
+  evaluation_interval: 30s
+
+scrape_configs:
+  - job_name: node
+    static_configs:
+      - targets: ["127.0.0.1:9100"]
+
+  - job_name: fleet
+    static_configs:
+      - targets: ["127.0.0.1:9877"]
